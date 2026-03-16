@@ -106,5 +106,80 @@ def project_gaussians(
     valid_mask = valid_mask & (radii > 0)
 
     depths = means_cam[valid_mask, 2]
-    
+
     return means_2d[valid_mask], covs_2d[valid_mask], depths, radii[valid_mask], valid_mask
+
+
+def get_tile_assignments(
+    means_2d: torch.Tensor,
+    radii: torch.Tensor,
+    image_height: int,
+    image_width: int,
+    tile_size: int = 16,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Assign each visible Gaussian to the screen tiles it overlaps.
+
+    The screen is divided into a grid of tile_size x tile_size pixel tiles.
+    Each Gaussian's bounding circle (center + radius) is tested against the tile grid
+    to find all tiles it touches. This produces a list of (gaussian_idx, tile_id) pairs
+    that tells us which Gaussians contribute to which tiles.
+
+    Args:
+        means_2d: (M, 2) screen-space positions of visible Gaussians.
+        radii: (M,) bounding circle radius in pixels (at 3σ).
+        image_height: output image height in pixels.
+        image_width: output image width in pixels.
+        tile_size: tile dimension in pixels (default 16x16).
+
+    Returns:
+        gaussian_ids: (P,) index into means_2d for each Gaussian-tile pair.
+        tile_ids: (P,) flat tile index for each Gaussian-tile pair.
+        tiles_per_gaussian: (M,) how many tiles each Gaussian overlaps (useful for debugging).
+    """
+    tiles_x = (image_width + tile_size - 1) // tile_size
+    tiles_y = (image_height + tile_size - 1) // tile_size
+
+    """ NOTE: radii is derived from lambda_max (largest eigenvalue), so the bounding region
+    is a circle, not an ellipse. For elongated Gaussians this overestimates — some tiles
+    will be assigned even though the Gaussian barely reaches them. This is conservative
+    (no visual errors), just slightly more work in alpha blending where those pixels will
+    evaluate to near-zero alpha and get skipped. A tighter approach would use an AABB from
+    the covariance diagonal: extent_x = 3*sqrt(cov[0,0]), extent_y = 3*sqrt(cov[1,1]),
+    which is what the original CUDA implementation (diff-gaussian-rasterization) uses.
+    """
+    # Compute the tile range each Gaussian's bounding box covers.
+    # Clamp to valid tile indices [0, tiles_x) and [0, tiles_y)
+    tile_min_x = torch.clamp((means_2d[:, 0] - radii) / tile_size, min=0, max=tiles_x - 1).int()
+    tile_max_x = torch.clamp((means_2d[:, 0] + radii) / tile_size, min=0, max=tiles_x - 1).int()
+    tile_min_y = torch.clamp((means_2d[:, 1] - radii) / tile_size, min=0, max=tiles_y - 1).int()
+    tile_max_y = torch.clamp((means_2d[:, 1] + radii) / tile_size, min=0, max=tiles_y - 1).int()
+
+    # Width and height of each Gaussian's tile bounding box
+    widths = tile_max_x - tile_min_x + 1
+    heights = tile_max_y - tile_min_y + 1
+    tiles_per_gaussian = widths * heights
+
+    # Total number of (gaussian, tile) pairs
+    P = tiles_per_gaussian.sum().item()
+
+    # Repeat each Gaussian's index and tile-box params by its tile count
+    gaussian_ids = torch.repeat_interleave(torch.arange(means_2d.shape[0]), tiles_per_gaussian)
+    min_x_rep = torch.repeat_interleave(tile_min_x, tiles_per_gaussian)
+    min_y_rep = torch.repeat_interleave(tile_min_y, tiles_per_gaussian)
+    widths_rep = torch.repeat_interleave(widths, tiles_per_gaussian)
+
+    # For each pair, compute the local offset within that Gaussian's tile grid
+    # local_idx goes 0, 1, 2, ... tiles_per_gaussian[i]-1 for each Gaussian
+    offsets = torch.arange(P) - torch.repeat_interleave(
+        torch.cat([torch.zeros(1, dtype=torch.int32), tiles_per_gaussian.cumsum(0)[:-1]]),
+        tiles_per_gaussian,
+    )
+
+    # Convert local offset to (dx, dy) within the Gaussian's tile bounding box
+    dy = offsets // widths_rep
+    dx = offsets % widths_rep
+
+    # Compute flat tile index: (min_y + dy) * tiles_x + (min_x + dx)
+    tile_ids = (min_y_rep + dy) * tiles_x + (min_x_rep + dx)
+
+    return gaussian_ids, tile_ids, tiles_per_gaussian

@@ -183,3 +183,68 @@ def get_tile_assignments(
     tile_ids = (min_y_rep + dy) * tiles_x + (min_x_rep + dx)
 
     return gaussian_ids, tile_ids, tiles_per_gaussian
+
+
+def sort_and_bin(
+    gaussian_ids: torch.Tensor,
+    tile_ids: torch.Tensor,
+    depths: torch.Tensor,
+    tiles_x: int,
+    tiles_y: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sort Gaussians by (tile_id, depth) and compute per-tile start/end ranges.
+
+    After tile assignment, we have a flat list of (gaussian_idx, tile_id) pairs.
+    This function sorts them so that all Gaussians for the same tile are contiguous,
+    and within each tile they are ordered front-to-back by depth. It then computes
+    a range table so we can quickly look up which slice of the sorted array belongs
+    to each tile.
+
+    This stays on CPU — sorting is hard to parallelize on tt-metal and even the
+    original CUDA implementation uses a GPU radix sort (a highly specialized algorithm).
+
+    Args:
+        gaussian_ids: (P,) Gaussian index for each pair.
+        tile_ids: (P,) tile index for each pair.
+        depths: (M,) depth of each visible Gaussian (indexed by gaussian_ids).
+        tiles_x: number of tiles horizontally.
+        tiles_y: number of tiles vertically.
+
+    Returns:
+        sorted_gaussian_ids: (P,) Gaussian indices sorted by (tile_id, depth).
+        tile_ranges: (num_tiles, 2) start and end index in sorted array for each tile.
+    """
+    num_tiles = tiles_x * tiles_y
+
+    # Create a composite sort key: tile_id first, then depth within each tile.
+    # Sorting by (tile_id * large_number + depth) achieves lexicographic ordering.
+    # We use a scale factor large enough that depth differences never cross tile boundaries.
+    max_depth = depths.max().item() + 1.0
+    sort_keys = tile_ids.float() * max_depth + depths[gaussian_ids]
+
+    # Sort all pairs by the composite key
+    sorted_indices = torch.argsort(sort_keys)
+    sorted_gaussian_ids = gaussian_ids[sorted_indices]
+    sorted_tile_ids = tile_ids[sorted_indices]
+
+    # Build tile ranges: for each tile, find where its Gaussians start and end
+    # in the sorted array. Tiles with no Gaussians get range (0, 0).
+    tile_ranges = torch.zeros(num_tiles, 2, dtype=torch.int64)
+
+    if sorted_tile_ids.numel() > 0:
+        # Detect where tile_id changes in the sorted array
+        changes = sorted_tile_ids[1:] != sorted_tile_ids[:-1]
+        change_indices = torch.where(changes)[0] + 1
+
+        # Start indices: position 0 + every change point
+        starts = torch.cat([torch.zeros(1, dtype=torch.int64), change_indices])
+        # End indices: every change point + final position
+        ends = torch.cat([change_indices, torch.tensor([len(sorted_tile_ids)])])
+
+        # The tile at each segment
+        segment_tiles = sorted_tile_ids[starts]
+
+        tile_ranges[segment_tiles, 0] = starts
+        tile_ranges[segment_tiles, 1] = ends
+
+    return sorted_gaussian_ids, tile_ranges

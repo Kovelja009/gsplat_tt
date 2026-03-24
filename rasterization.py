@@ -1,6 +1,6 @@
 import torch
 
-from utils import build_covariance_3d
+from utils import build_covariance_3d, inverse_cov_2d, calc_gaussian_strength
 
 
 def project_gaussians(
@@ -248,3 +248,113 @@ def sort_and_bin(
         tile_ranges[segment_tiles, 1] = ends
 
     return sorted_gaussian_ids, tile_ranges
+
+
+def alpha_blend(
+    means_2d: torch.Tensor,
+    covs_2d: torch.Tensor,
+    colors: torch.Tensor,
+    opacities: torch.Tensor,
+    sorted_gaussian_ids: torch.Tensor,
+    tile_ranges: torch.Tensor,
+    image_height: int,
+    image_width: int,
+    tile_size: int = 16,
+) -> torch.Tensor:
+    """Render the final image by compositing Gaussians front-to-back per pixel.
+
+    For each tile, iterates through its sorted Gaussians. For each pixel in the tile,
+    evaluates the 2D Gaussian weight and accumulates color using alpha compositing:
+
+        C_pixel += alpha_i * T * color_i
+        T *= (1 - alpha_i)
+
+    where T is the accumulated transmittance (starts at 1, decreases as Gaussians are
+    composited). Early termination when T < 0.0001 (pixel is effectively saturated).
+
+    The alpha for each Gaussian at a pixel is:
+        alpha = opacity * exp(-0.5 * d^T @ Σ_2D⁻¹ @ d)
+    where d = pixel_position - gaussian_center.
+
+    Args:
+        means_2d: (M, 2) screen-space Gaussian centers.
+        covs_2d: (M, 2, 2) 2D covariance matrices.
+        colors: (M, 3) RGB colors per Gaussian.
+        opacities: (M,) opacity values in [0, 1].
+        sorted_gaussian_ids: (P,) Gaussian indices sorted by (tile_id, depth).
+        tile_ranges: (num_tiles, 2) start/end indices per tile in sorted array.
+        image_height: output image height in pixels.
+        image_width: output image width in pixels.
+        tile_size: tile dimension in pixels (default 16x16).
+
+    Returns:
+        image: (image_height, image_width, 3) rendered RGB image.
+    """
+    image = torch.zeros(image_height, image_width, 3, dtype=means_2d.dtype)
+    tiles_x = (image_width + tile_size - 1) // tile_size
+    tiles_y = (image_height + tile_size - 1) // tile_size
+
+    # Precompute inverse of each 2D covariance matrix
+    cov_inv = inverse_cov_2d(covs_2d)
+
+    for ty in range(tiles_y):
+        for tx in range(tiles_x):
+            tile_id = ty * tiles_x + tx
+            start, end = tile_ranges[tile_id, 0].item(), tile_ranges[tile_id, 1].item()
+
+            if start == end:
+                continue
+
+            # Pixel coordinates for this tile
+            py_start = ty * tile_size
+            px_start = tx * tile_size
+            py_end = min(py_start + tile_size, image_height)
+            px_end = min(px_start + tile_size, image_width)
+
+            # Create grid of pixel centers (offset by 0.5 to sample at pixel center)
+            py = torch.arange(py_start, py_end, dtype=means_2d.dtype) + 0.5
+            px = torch.arange(px_start, px_end, dtype=means_2d.dtype) + 0.5
+            grid_y, grid_x = torch.meshgrid(py, px, indexing="ij")
+
+            # (tile_h, tile_w, 2)
+            pixels = torch.stack([grid_x, grid_y], dim=-1)
+
+            tile_h = py_end - py_start
+            tile_w = px_end - px_start
+
+            # Accumulated color and transmittance per pixel
+            accumulated_color = torch.zeros(tile_h, tile_w, 3, dtype=means_2d.dtype)
+            transmittance = torch.ones(tile_h, tile_w, dtype=means_2d.dtype)
+
+            # Iterate through Gaussians for this tile (front-to-back)
+            for idx in range(start, end):
+                g = sorted_gaussian_ids[idx].item()
+
+                # d = pixel - gaussian_center, shape (tile_h, tile_w, 2)
+                d = pixels - means_2d[g]
+
+                dx, dy = d[..., 0], d[..., 1]
+                gauss_weight = calc_gaussian_strength(dx, dy, cov_inv[g])
+
+                alpha = opacities[g] * gauss_weight
+                alpha = torch.clamp(alpha, max=0.99)
+
+                # NOTE: the original CUDA implementation skips pixels where alpha < 1/255
+                # (invisible in 8-bit output). We skip that here because masking individual
+                # pixels in a vectorized tile operation adds more overhead than computing
+                # the near-zero contribution. Worth doing in the tt-metal kernel.
+
+                # Alpha compositing: color += alpha * T * gaussian_color
+                weight = alpha * transmittance
+                accumulated_color += weight.unsqueeze(-1) * colors[g]
+
+                # Update transmittance
+                transmittance = transmittance * (1.0 - alpha)
+
+                # Early termination: if all pixels in tile are saturated, stop
+                if transmittance.max() < 0.0001:
+                    break
+
+            image[py_start:py_end, px_start:px_end] = accumulated_color
+
+    return image

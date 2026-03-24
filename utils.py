@@ -53,3 +53,77 @@ def build_covariance_3d(scales: torch.Tensor, rotations: torch.Tensor) -> torch.
 
     # Σ = RS @ RS^T
     return RS @ RS.transpose(1, 2)  # (N, 3, 3)
+
+
+def calc_det(covs_2d: torch.Tensor) -> torch.Tensor:
+    """Compute determinant of 2x2 symmetric covariance matrices.
+
+    For [[a, b], [b, c]], det = a*c - b².
+    Clamped to 1e-6 to avoid division by zero when inverting.
+
+    Args:
+        covs_2d: (N, 2, 2) covariance matrices.
+
+    Returns:
+        (N,) determinants.
+    """
+    a = covs_2d[:, 0, 0]
+    b = covs_2d[:, 0, 1]
+    c = covs_2d[:, 1, 1]
+    return torch.clamp(a * c - b * b, min=1e-6)
+
+
+def inverse_cov_2d(covs_2d: torch.Tensor) -> torch.Tensor:
+    """Compute inverse of 2x2 symmetric covariance matrices.
+
+    For [[a, b], [b, c]], the inverse is (1/det) * [[c, -b], [-b, a]].
+
+    Args:
+        covs_2d: (N, 2, 2) covariance matrices.
+
+    Returns:
+        (N, 2, 2) inverse covariance matrices.
+    """
+    det = calc_det(covs_2d)
+
+    a = covs_2d[:, 0, 0]
+    b = covs_2d[:, 0, 1]
+    c = covs_2d[:, 1, 1]
+
+    cov_inv = torch.zeros_like(covs_2d)
+    cov_inv[:, 0, 0] = c / det
+    cov_inv[:, 0, 1] = -b / det
+    cov_inv[:, 1, 0] = -b / det
+    cov_inv[:, 1, 1] = a / det
+
+    return cov_inv
+
+
+def calc_gaussian_strength(
+    dx: torch.Tensor,
+    dy: torch.Tensor,
+    cov_inv: torch.Tensor,
+) -> torch.Tensor:
+    """Evaluate the Gaussian weight at pixel displacements from the center.
+
+    Computes exp(-0.5 * d^T @ Σ⁻¹ @ d) for each pixel, which is the Gaussian's
+    contribution strength (1.0 at center, falling off with distance).
+    This is the Mahalanobis distance expanded into scalar form:
+        -0.5 * (inv_00*dx² + 2*inv_01*dx*dy + inv_11*dy²)
+
+    Args:
+        dx: (...) x-displacement from Gaussian center per pixel.
+        dy: (...) y-displacement from Gaussian center per pixel.
+        cov_inv: (2, 2) inverse covariance matrix for this Gaussian.
+
+    Returns:
+        (...) Gaussian strength values in (0, 1].
+    """
+    power = -0.5 * (
+        cov_inv[0, 0] * dx * dx
+        + 2.0 * cov_inv[0, 1] * dx * dy
+        + cov_inv[1, 1] * dy * dy
+    )
+    # Clamp to <= 0: positive values are numerical errors (Mahalanobis distance is always >= 0)
+    power = torch.clamp(power, max=0.0)
+    return torch.exp(power)

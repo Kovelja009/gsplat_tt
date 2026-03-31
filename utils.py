@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 
 
 def quat_to_rotation_matrix(quats: torch.Tensor) -> torch.Tensor:
@@ -127,3 +128,26 @@ def calc_gaussian_strength(
     # Clamp to <= 0: positive values are numerical errors (Mahalanobis distance is always >= 0)
     power = torch.clamp(power, max=0.0)
     return torch.exp(power)
+
+
+def c2w_to_w2c(c2w: np.ndarray) -> torch.Tensor:
+    """Invert a camera-to-world matrix to get world-to-camera (our extrinsics).
+
+    Viser/nerfview provides c2w in OpenCV convention (+Z forward, +Y down),
+    which matches our rasterizer's convention. We just need to invert.
+
+    Uses the closed-form inverse of a rigid-body transform (R^T, -R^T @ t)
+    instead of np.linalg.inv for better numerical stability.
+
+    Args:
+        c2w: (4, 4) camera-to-world matrix.
+
+    Returns:
+        (4, 4) world-to-camera matrix (float32).
+    """
+    R = c2w[:3, :3]
+    t = c2w[:3, 3]
+    w2c = np.eye(4, dtype=np.float32)
+    w2c[:3, :3] = R.T
+    w2c[:3, 3] = -R.T @ t
+    return torch.tensor(w2c)

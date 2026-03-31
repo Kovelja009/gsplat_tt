@@ -6,7 +6,7 @@ import viser
 import nerfview
 
 from data_structures import Gaussians
-from camera_utils import c2w_to_w2c
+from utils import c2w_to_w2c
 from rasterization import (
     project_gaussians,
     get_tile_assignments,
@@ -86,8 +86,7 @@ class GaussianViewer:
             return np.zeros((max(H, 1), max(W, 1), 3), dtype=np.uint8)
 
         # Invert c2w to get our W2C extrinsics
-        w2c = c2w_to_w2c(camera_state.c2w)
-        extrinsics = torch.tensor(w2c, dtype=torch.float32)
+        extrinsics = c2w_to_w2c(camera_state.c2w)
 
         # Intrinsics from nerfview's camera FOV
         intrinsics = torch.tensor(

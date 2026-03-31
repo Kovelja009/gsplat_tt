@@ -1,6 +1,7 @@
+import numpy as np
 import torch
 
-from utils import build_covariance_3d, inverse_cov_2d, calc_gaussian_strength
+from utils import build_covariance_3d
 
 
 def project_gaussians(
@@ -290,17 +291,33 @@ def alpha_blend(
     Returns:
         image: (image_height, image_width, 3) rendered RGB image.
     """
-    image = torch.zeros(image_height, image_width, 3, dtype=means_2d.dtype)
     tiles_x = (image_width + tile_size - 1) // tile_size
     tiles_y = (image_height + tile_size - 1) // tile_size
 
-    # Precompute inverse of each 2D covariance matrix
-    cov_inv = inverse_cov_2d(covs_2d)
+    # Convert to numpy: lower per-op overhead (~2µs vs ~10µs for PyTorch on small arrays),
+    # giving ~3-5x speedup on the inner loop which dominates rendering time.
+    means_np = means_2d.numpy()
+    colors_np = colors.numpy()
+    opacities_np = opacities.numpy()
+    gids_np = sorted_gaussian_ids.numpy()
+    ranges_np = tile_ranges.numpy()
+
+    # Precompute inverse covariances in numpy
+    covs_np = covs_2d.numpy()
+    a, b, c = covs_np[:, 0, 0], covs_np[:, 0, 1], covs_np[:, 1, 1]
+    det = np.maximum(a * c - b * b, 1e-6)
+    cov_inv_np = np.zeros_like(covs_np)
+    cov_inv_np[:, 0, 0] = c / det
+    cov_inv_np[:, 0, 1] = -b / det
+    cov_inv_np[:, 1, 0] = -b / det
+    cov_inv_np[:, 1, 1] = a / det
+
+    image = np.zeros((image_height, image_width, 3), dtype=np.float32)
 
     for ty in range(tiles_y):
         for tx in range(tiles_x):
             tile_id = ty * tiles_x + tx
-            start, end = tile_ranges[tile_id, 0].item(), tile_ranges[tile_id, 1].item()
+            start, end = ranges_np[tile_id, 0], ranges_np[tile_id, 1]
 
             if start == end:
                 continue
@@ -311,33 +328,30 @@ def alpha_blend(
             py_end = min(py_start + tile_size, image_height)
             px_end = min(px_start + tile_size, image_width)
 
-            # Create grid of pixel centers (offset by 0.5 to sample at pixel center)
-            py = torch.arange(py_start, py_end, dtype=means_2d.dtype) + 0.5
-            px = torch.arange(px_start, px_end, dtype=means_2d.dtype) + 0.5
-            grid_y, grid_x = torch.meshgrid(py, px, indexing="ij")
-
-            # (tile_h, tile_w, 2)
-            pixels = torch.stack([grid_x, grid_y], dim=-1)
-
             tile_h = py_end - py_start
             tile_w = px_end - px_start
 
+            # Grid of pixel centers (offset by 0.5 to sample at pixel center)
+            py = np.arange(py_start, py_end, dtype=np.float32) + 0.5
+            px = np.arange(px_start, px_end, dtype=np.float32) + 0.5
+            grid_y, grid_x = np.meshgrid(py, px, indexing="ij")  # (tile_h, tile_w)
+
             # Accumulated color and transmittance per pixel
-            accumulated_color = torch.zeros(tile_h, tile_w, 3, dtype=means_2d.dtype)
-            transmittance = torch.ones(tile_h, tile_w, dtype=means_2d.dtype)
+            accumulated_color = np.zeros((tile_h, tile_w, 3), dtype=np.float32)
+            transmittance = np.ones((tile_h, tile_w), dtype=np.float32)
 
             # Iterate through Gaussians for this tile (front-to-back)
             for idx in range(start, end):
-                g = sorted_gaussian_ids[idx].item()
+                g = gids_np[idx]
 
-                # d = pixel - gaussian_center, shape (tile_h, tile_w, 2)
-                d = pixels - means_2d[g]
+                dx = grid_x - means_np[g, 0]  # (tile_h, tile_w)
+                dy = grid_y - means_np[g, 1]
 
-                dx, dy = d[..., 0], d[..., 1]
-                gauss_weight = calc_gaussian_strength(dx, dy, cov_inv[g])
+                ci = cov_inv_np[g]
+                power = -0.5 * (ci[0, 0] * dx * dx + 2.0 * ci[0, 1] * dx * dy + ci[1, 1] * dy * dy)
+                gauss_weight = np.exp(np.minimum(power, 0.0))
 
-                alpha = opacities[g] * gauss_weight
-                alpha = torch.clamp(alpha, max=0.99)
+                alpha = np.clip(opacities_np[g] * gauss_weight, None, 0.99)
 
                 # NOTE: the original CUDA implementation skips pixels where alpha < 1/255
                 # (invisible in 8-bit output). We skip that here because masking individual
@@ -345,11 +359,10 @@ def alpha_blend(
                 # the near-zero contribution. Worth doing in the tt-metal kernel.
 
                 # Alpha compositing: color += alpha * T * gaussian_color
-                weight = alpha * transmittance
-                accumulated_color += weight.unsqueeze(-1) * colors[g]
+                accumulated_color += (alpha * transmittance)[:, :, np.newaxis] * colors_np[g]
 
                 # Update transmittance
-                transmittance = transmittance * (1.0 - alpha)
+                transmittance *= (1.0 - alpha)
 
                 # Early termination: if all pixels in tile are saturated, stop
                 if transmittance.max() < 0.0001:
@@ -357,4 +370,4 @@ def alpha_blend(
 
             image[py_start:py_end, px_start:px_end] = accumulated_color
 
-    return image
+    return torch.from_numpy(image)

@@ -1,4 +1,4 @@
-# 3D Gaussian Splatting — CPU Reference Rasterizer
+# 3D Gaussian Splatting - CPU Reference Rasterizer
 
 MSc thesis project implementing the forward-pass rendering pipeline of
 [3D Gaussian Splatting](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/)
@@ -52,13 +52,13 @@ Then open `http://localhost:8080` in a browser. Use the orbit controls to naviga
 
 Optional arguments:
 
-```
+```bash
 python main.py path/to/scene.ply --port 8080 --host 0.0.0.0
 ```
 
 ## Performance
 
-The CPU rasterizer is intentionally simple — it is a reference implementation, not a
+The CPU rasterizer is intentionally simple - it is a reference implementation, not a
 production renderer. At 256×256 resolution expect roughly 1–2 seconds per frame.
 The bottleneck is the Python tile loop in `alpha_blend` (~70K iterations per frame).
 

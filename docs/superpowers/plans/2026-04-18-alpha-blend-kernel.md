@@ -468,7 +468,7 @@ Run:
 ```bash
 cd /localdev/vkovinic/gsplat_tt/tt-metal
 source python_env/bin/activate
-./build_metal.sh
+sudo ./build_metal.sh
 ```
 Expected: build completes. Watch for `TTMLIR_TOOLCHAIN_DIR` issues; set if needed (see `tt-metal/README.md`).
 
@@ -748,7 +748,7 @@ Run:
 ```bash
 cd /localdev/vkovinic/gsplat_tt/tt-metal
 source python_env/bin/activate
-./build_metal.sh
+sudo ./build_metal.sh
 ```
 Expected: builds cleanly. Check `./build/programming_examples/metal_example_gaussian_splatting` exists.
 
@@ -964,7 +964,7 @@ Run:
 ```bash
 cd /localdev/vkovinic/gsplat_tt/tt-metal
 source python_env/bin/activate
-./build_metal.sh
+sudo ./build_metal.sh
 ```
 Expected: builds cleanly.
 
@@ -1557,7 +1557,7 @@ Run:
 ```bash
 cd /localdev/vkovinic/gsplat_tt/tt-metal
 source python_env/bin/activate
-./build_metal.sh
+sudo ./build_metal.sh
 ```
 Expected: compiles cleanly.
 
@@ -1819,7 +1819,7 @@ Run:
 ```bash
 cd /localdev/vkovinic/gsplat_tt
 source tt-metal/python_env/bin/activate
-./tt-metal/build_metal.sh
+sudo ./tt-metal/build_metal.sh
 ```
 Expected: builds cleanly.
 
@@ -2107,7 +2107,7 @@ Run:
 ```bash
 cd /localdev/vkovinic/gsplat_tt
 source tt-metal/python_env/bin/activate
-./tt-metal/build_metal.sh
+sudo ./tt-metal/build_metal.sh
 ```
 Expected: builds cleanly.
 
@@ -2516,7 +2516,7 @@ Run:
 ```bash
 cd /localdev/vkovinic/gsplat_tt
 source tt-metal/python_env/bin/activate
-./tt-metal/build_metal.sh
+sudo ./tt-metal/build_metal.sh
 ```
 Expected: builds cleanly.
 
@@ -2706,7 +2706,7 @@ def _psnr(a, b):
 
 @pytest.mark.skipif(
     not os.path.exists(KERNEL_BINARY),
-    reason="kernel binary not built; run ./build_metal.sh",
+    reason="kernel binary not built; run sudo ./build_metal.sh",
 )
 def test_full_scene_psnr():
     torch.manual_seed(42)
@@ -2899,7 +2899,7 @@ In `alpha_blend.cpp`, replace the single-core setup with:
 
 Run:
 ```bash
-./tt-metal/build_metal.sh
+sudo ./tt-metal/build_metal.sh
 pytest tests/test_kernel_integration.py -v -s
 ```
 Expected: PSNR unchanged; wall-clock speedup visible.
@@ -2956,7 +2956,7 @@ Reader changes: read `tile_id = tile_ids[t]` instead of `first_tile_id + t`.
 - [ ] **Step 3: Build + test**
 
 ```bash
-./tt-metal/build_metal.sh
+sudo ./tt-metal/build_metal.sh
 pytest tests/test_kernel_integration.py -v -s
 ```
 Record the new speedup. Target: ≥15×.

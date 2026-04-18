@@ -89,3 +89,21 @@ psnr = compute_psnr(image_cpu, image_tt)
 - **For Python scripts / tests / `rasterization.py` / `viewer.py`**: activate the project venv at repo root — `source venv/bin/activate`.
 - **For anything touching `ttnn` or tt-metal (building kernels, running the C++ harness, Python scripts that import `ttnn`)**: activate the tt-metal venv instead — `source tt-metal/python_env/bin/activate`. That venv is created by `tt-metal/create_venv.sh` during the initial tt-metal build and lives at `tt-metal/python_env/` (note: `python_env`, not `venv`).
 - Don't mix the two venvs in one shell — `deactivate` before switching.
+
+## tt-metal vendoring
+
+The `tt-metal/` directory is a vendored clone of `tenstorrent/tt-metal`. It's mostly git-ignored; only `tt-metal/tt_metal/programming_examples/gaussian_splatting/` is tracked (via `.gitignore` exceptions).
+
+**One-time setup after re-vendoring tt-metal**:
+1. Remove the embedded `.git/` so the parent repo can track files inside:
+   ```bash
+   rm -rf tt-metal/.git
+   ```
+2. Register our kernel subdir in tt-metal's CMake (edit the vendored file, will NOT be tracked):
+   ```cmake
+   # tt-metal/tt_metal/programming_examples/CMakeLists.txt
+   add_subdirectory(gaussian_splatting)
+   ```
+3. Build tt-metal: `cd tt-metal && source python_env/bin/activate && sudo ./build_metal.sh`
+
+**Note**: building requires `sudo` on this system because `tt-metal/runtime/sfpi/` and `tt-metal/.cpmcache/` are root-owned from the initial dependency install. Always prefix `./build_metal.sh` with `sudo`.

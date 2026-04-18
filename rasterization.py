@@ -371,3 +371,75 @@ def alpha_blend(
             image[py_start:py_end, px_start:px_end] = accumulated_color
 
     return torch.from_numpy(image)
+
+
+def prepare_kernel_inputs(
+    means_2d: torch.Tensor,
+    covs_2d: torch.Tensor,
+    colors: torch.Tensor,
+    opacities: torch.Tensor,
+    sorted_gaussian_ids: torch.Tensor,
+    tile_ranges: torch.Tensor,
+    image_height: int,
+    image_width: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Pack per-tile Gaussian attributes for the tt-metal kernel.
+
+    Produces:
+      attribute_packs: (N_entries, 9) fp32, per row:
+          [mean_x, mean_y, cov_inv_a, 2*cov_inv_b, cov_inv_c, R, G, B, opacity]
+      tile_offsets: (num_tiles + 1,) uint32, cumulative prefix sum.
+      px_tiles, py_tiles: (num_tiles, 32, 32) fp32, global screen coords.
+    """
+    tiles_x = (image_width + 31) // 32
+    tiles_y = (image_height + 31) // 32
+    num_tiles = tiles_x * tiles_y
+
+    # Invert covariances (same math as alpha_blend)
+    a = covs_2d[:, 0, 0]
+    b = covs_2d[:, 0, 1]
+    c = covs_2d[:, 1, 1]
+    det = torch.clamp(a * c - b * b, min=1e-6)
+    cov_inv_a = (c / det).numpy()
+    cov_inv_b = (-b / det).numpy()
+    cov_inv_c = (a / det).numpy()
+
+    means_np = means_2d.numpy()
+    colors_np = colors.numpy()
+    opacities_np = opacities.numpy()
+    gids_np = sorted_gaussian_ids.numpy()
+    ranges_np = tile_ranges.numpy()
+
+    # Flatten (tile_id, g_idx) pairs and build attribute_packs in sorted order
+    total_entries = int((ranges_np[:, 1] - ranges_np[:, 0]).sum())
+
+    attribute_packs = np.zeros((total_entries, 9), dtype=np.float32)
+    tile_offsets = np.zeros(num_tiles + 1, dtype=np.uint32)
+
+    write_pos = 0
+    for tile_id in range(num_tiles):
+        start, end = int(ranges_np[tile_id, 0]), int(ranges_np[tile_id, 1])
+        tile_offsets[tile_id] = write_pos
+        for idx in range(start, end):
+            g = gids_np[idx]
+            attribute_packs[write_pos] = [
+                means_np[g, 0], means_np[g, 1],
+                cov_inv_a[g], 2.0 * cov_inv_b[g], cov_inv_c[g],
+                colors_np[g, 0], colors_np[g, 1], colors_np[g, 2],
+                opacities_np[g],
+            ]
+            write_pos += 1
+    tile_offsets[num_tiles] = write_pos
+
+    # Build px/py tiles
+    px_tiles = np.zeros((num_tiles, 32, 32), dtype=np.float32)
+    py_tiles = np.zeros((num_tiles, 32, 32), dtype=np.float32)
+    for tile_id in range(num_tiles):
+        ty = tile_id // tiles_x
+        tx = tile_id % tiles_x
+        for j in range(32):
+            for i in range(32):
+                px_tiles[tile_id, i, j] = tx * 32 + j + 0.5
+                py_tiles[tile_id, i, j] = ty * 32 + i + 0.5
+
+    return attribute_packs, tile_offsets, px_tiles, py_tiles

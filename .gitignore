@@ -219,3 +219,11 @@ __marimo__/
 
 # Thesis plan for easier navigation
 thesis_plan.md
+
+# Vendored tt-metal tree — ignore contents except our programming_examples/gaussian_splatting subdir
+/tt-metal/*
+!/tt-metal/tt_metal
+/tt-metal/tt_metal/*
+!/tt-metal/tt_metal/programming_examples
+/tt-metal/tt_metal/programming_examples/*
+!/tt-metal/tt_metal/programming_examples/gaussian_splatting

@@ -86,4 +86,6 @@ psnr = compute_psnr(image_cpu, image_tt)
 
 ## Instructions
 
-- first always activate venv - `source venv/bin/activate`
+- **For Python scripts / tests / `rasterization.py` / `viewer.py`**: activate the project venv at repo root — `source venv/bin/activate`.
+- **For anything touching `ttnn` or tt-metal (building kernels, running the C++ harness, Python scripts that import `ttnn`)**: activate the tt-metal venv instead — `source tt-metal/python_env/bin/activate`. That venv is created by `tt-metal/create_venv.sh` during the initial tt-metal build and lives at `tt-metal/python_env/` (note: `python_env`, not `venv`).
+- Don't mix the two venvs in one shell — `deactivate` before switching.

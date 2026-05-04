@@ -258,6 +258,51 @@ Spec Rev 3 is approved for transition to `writing-plans` skill.
 
 ---
 
+## Known Issues
+
+### KI-1 — T0.6 saturation test fails at edges (deferred to v2)
+
+**Status**: tracked, deferred. Commit `ce3f194` ships T0.6 as a known-failing reproducer.
+
+**Symptom**: T0.6 stacks 50 nearly-opaque Gaussians (α=0.99, cov=100) at the tile center.
+Center pixel renders correctly (0.5). Most other pixels saturate to the bf16 value 0x4790
+(= 73728.0) instead of remaining near 0. The pattern is a smooth gradient growing with
+distance from center, with row 16 and column 16 (the Gaussian's center cross) hitting
+saturation hardest.
+
+**Bug is iteration-dependent**: T0.5 (2 Gaussians, same cov) is perfect (max diff 7e-26).
+T0.6 (50 Gaussians, same cov) blows up. So the divergence accumulates over iterations of
+the per-Gaussian state-CB loop, not from a single-shot exp() bug.
+
+**Two latent bugs found and fixed during investigation** (kept in commit `ce3f194` because
+they are real correctness improvements, even though they did not resolve T0.6):
+
+1. Missing `binary_min_tile_init()` re-init before the second `min(α, 0.99)` clamp in
+   Stage C. The original kernel relied on SFPU SWAP-mode persistence from the earlier
+   `min(power, 0)`. Adding `binary_max_tile_init()` for the new max-clamp exposed this:
+   without explicit re-init, the second `min` became a `max`, clamping every alpha to
+   0.99. **Real bug, fix shipped.**
+2. `exp_tile` in `approx=false` mode produces garbage for inputs below ~-88.5 (per
+   `exp.h` header docs — input clamping only activates in approx mode). At edge pixels
+   of T0.6, power reaches -25600. **Defensive clamp (power >= -89) shipped via new
+   `CB_CONST_NEG88`**, but did not resolve T0.6.
+
+**Why it likely doesn't gate the thesis**: realistic 3DGS scenes don't stack 50 highly-
+opaque tight Gaussians at one pixel. v1a (single Gaussian) and T0.5 (two Gaussians)
+both pass cleanly, and Task 3.4 (full-scene PSNR integration) uses realistic Gaussians.
+If 3.4 hits ≥35 dB PSNR, T0.6 is logged as v2 cleanup.
+
+**Suspected next debug steps when revisited**:
+- Test `exp_tile<approx=true, ..., ClampToNegative>` — built-in input clamp at -88.5
+- Bisect iteration count (5 / 10 / 20 / 30 / 40 Gaussians) to find where divergence first appears
+- Verify SFPU `SFPU_TEMPLATE_PARAMS_KERNEL_FN` macro vs `_calculate_exponential_` template-arg
+  alignment (subagent flagged a possible positional shuffle of `is_fp32_dest_acc_en`,
+  `SCALE_EN`, `CLAMP_NEGATIVE`)
+- Investigate whether per-iteration scratch CB pop/push hazards leave stale data
+  visible to the unpacker on subsequent iterations
+
+---
+
 ## Next Steps (after all decisions locked)
 
 1. Write full design spec to `docs/superpowers/specs/YYYY-MM-DD-alpha-blend-kernel-design.md`

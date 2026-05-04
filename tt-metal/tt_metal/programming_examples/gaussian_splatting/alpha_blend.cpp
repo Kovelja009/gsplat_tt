@@ -242,9 +242,22 @@ int main(int argc, char** argv) {
         cb_tile(CB_POWER, 2);
         cb_tile(CB_ALPHA, 2);
 
+        // v1b additional scratch CBs (depth 1).
+        cb_tile(CB_CONTRIB, 1);
+        cb_tile(CB_ONE_MINUS_ALPHA, 1);
+        cb_tile(CB_T_TMP, 1);
+
+        // v1b state CBs (depth 1, persistent across Gaussian loop).
+        cb_tile(CB_COLOR_R_STATE, 1);
+        cb_tile(CB_COLOR_G_STATE, 1);
+        cb_tile(CB_COLOR_B_STATE, 1);
+        cb_tile(CB_T_STATE, 1);
+        cb_tile(CB_SAT_MASK, 1);
+
         // Constant CBs (depth 1; preloaded once by compute, never popped).
         cb_tile(CB_CONST_ZERO, 1);
         cb_tile(CB_CONST_099, 1);
+        cb_tile(CB_CONST_NEG88, 1);
 
         // Reader: 4 TensorAccessorArgs in order packs, offsets, px, py.
         std::vector<uint32_t> reader_ct;

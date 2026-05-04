@@ -227,3 +227,7 @@ thesis_plan.md
 !/tt-metal/tt_metal/programming_examples
 /tt-metal/tt_metal/programming_examples/*
 !/tt-metal/tt_metal/programming_examples/gaussian_splatting
+
+# claude-mem auto-context files (allow only the root project CLAUDE.md)
+**/CLAUDE.md
+!/CLAUDE.md

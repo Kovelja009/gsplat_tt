@@ -225,7 +225,13 @@ int main(int argc, char** argv) {
         cb_tile(CB_PY, 2);
         cb_small(CB_SCALARS, SCALAR_PACK_PAGE_BYTES, 4, DataFormat::Float32);
         cb_small(CB_TILE_META, META_PAGE_BYTES, 2, DataFormat::UInt32);
-        cb_tile(CB_COLOR_OUT, 4);
+        // Depth must be a multiple of 3 (the per-tile batch size) so no
+        // single push-of-3 ever straddles the CB wrap. Otherwise the writer's
+        // `read_ptr += tile_bytes` arithmetic across the 3 channels is wrong:
+        // after the wrap the second/third NoC write would source from
+        // out-of-CB L1 instead of slots {0,1} or {0}. Picking 6 keeps two
+        // batches in flight (parity with the previous double-buffering depth).
+        cb_tile(CB_COLOR_OUT, 6);
 
         // Scratch CBs for v1a compute (depth 2 each, single-tile pages).
         cb_tile(CB_DX, 2);

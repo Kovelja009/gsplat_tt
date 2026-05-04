@@ -44,7 +44,14 @@ void kernel_main() {
     constexpr uint32_t CB_TILE_META = 3;
 
     const uint32_t tile_bytes        = get_tile_size(CB_PX);       // 2048 (32x32 bf16)
-    const uint32_t pack_bytes_padded = get_tile_size(CB_SCALARS);  // 64 (9 fp32 -> padded)
+    // NOTE: do NOT use get_tile_size(CB_SCALARS) here. CB_SCALARS is configured
+    // as DataFormat::Float32 (so the SFPU sees fp32), but with a sub-tile page
+    // size of 64 bytes (9 fp32 scalar pack). get_tile_size returns the format
+    // tile size (4096 for fp32 32x32), not the configured page size, so using
+    // it as the NoC transaction size would overflow the CB by 3840 bytes per
+    // Gaussian and trample adjacent L1 (manifests as a multi-tile hang once
+    // the corrupted L1 overlaps a CB descriptor).
+    constexpr uint32_t pack_bytes_padded = 64;  // matches host SCALAR_PACK_PAGE_BYTES
 
     constexpr auto packs_args   = TensorAccessorArgs<0>();
     constexpr auto offsets_args = TensorAccessorArgs<packs_args.next_compile_time_args_offset()>();

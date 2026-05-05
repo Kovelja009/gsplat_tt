@@ -2,24 +2,35 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// Task 2.5 v1a host driver for the gaussian_splatting alpha-blend pipeline.
+// Task 2.5 v1b host driver for the gaussian_splatting alpha-blend pipeline.
 //
-// CLI signature:
+// CLI signatures:
 //   metal_example_gaussian_splatting packs.npy offsets.npy px.npy py.npy output.npy [H] [W]
+//   metal_example_gaussian_splatting --daemon
 //
-// Loads four .npy fixtures, sets up DRAM buffers + circular buffers, runs the
-// reader/compute/writer kernels on a single core, reads back the output, and
-// writes a (H, W, 3) fp32 .npy image. The 11a sub-phase compute kernel emits a
-// constant solid color (R=0.25, G=0.5, B=0.75) so a successful run is trivially
-// verifiable.
+// Single-shot mode (the original interface): loads four .npy fixtures, opens
+// the device, JIT-compiles kernels, runs once, writes the output, exits.
+//
+// Daemon mode: opens the device + JIT-compiles kernels once. Reads
+// "FRAME H W packs.npy offsets.npy px.npy py.npy out.npy" lines from stdin in
+// a loop, processes each frame (per-frame DRAM realloc + new runtime args),
+// prints "OK <ms>" with kernel-only elapsed time, and exits cleanly on
+// EOF or "QUIT". This keeps the ~3s init/JIT cost out of the per-frame path,
+// enabling interactive viewer rates and meaningful per-frame perf measurement.
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <tt-metalium/bfloat16.hpp>
@@ -28,6 +39,7 @@
 #include <tt-metalium/distributed.hpp>
 #include <tt-metalium/host_api.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
+#include <tt-metalium/work_split.hpp>
 #include "tt-metalium/base_types.hpp"
 #include "tt-metalium/kernel_types.hpp"
 
@@ -41,12 +53,14 @@ using namespace gsplat;
 #define OVERRIDE_KERNEL_PREFIX ""
 #endif
 
-// Minimal .npy reader for fp32 arrays.
+// ---------------------------------------------------------------------------
+// .npy I/O helpers
+// ---------------------------------------------------------------------------
+
 static std::vector<float> load_npy_f32(const std::string& path, std::vector<size_t>& shape) {
     std::ifstream f(path, std::ios::binary);
     if (!f) {
-        std::cerr << "cannot open " << path << std::endl;
-        std::exit(1);
+        throw std::runtime_error("cannot open " + path);
     }
     char magic[6];
     f.read(magic, 6);
@@ -132,238 +146,467 @@ static std::vector<float> bf16_tile_to_fp32(const uint16_t* src) {
     return dst;
 }
 
-int main(int argc, char** argv) {
-    if (argc < 6) {
-        std::cerr << "Usage: " << argv[0] << " packs.npy offsets.npy px.npy py.npy output.npy [H] [W]\n";
-        return 1;
-    }
-    std::string packs_path = argv[1];
-    std::string offsets_path = argv[2];
-    std::string px_path = argv[3];
-    std::string py_path = argv[4];
-    std::string out_path = argv[5];
-    uint32_t image_h = argc > 6 ? static_cast<uint32_t>(std::stoi(argv[6])) : 32;
-    uint32_t image_w = argc > 7 ? static_cast<uint32_t>(std::stoi(argv[7])) : 32;
+// ---------------------------------------------------------------------------
+// Device + program reusable context
+// ---------------------------------------------------------------------------
 
-    uint32_t tiles_x = (image_w + 31) / 32;
-    uint32_t tiles_y = (image_h + 31) / 32;
-    uint32_t num_tiles = tiles_x * tiles_y;
+struct DeviceContext {
+    std::shared_ptr<distributed::MeshDevice> mesh_device;
+    distributed::MeshCommandQueue* cq = nullptr;
+    distributed::MeshWorkload workload;
+    KernelHandle reader{};
+    KernelHandle compute{};
+    KernelHandle writer{};
+    // Full compute grid (e.g. 8x8 on Wormhole N150 after harvesting).
+    // CBs and kernels are allocated on every core in this range at init;
+    // per-frame, split_work_to_cores carves [0, num_tiles) into a contiguous
+    // slice per core via SetRuntimeArgs.
+    CoreCoord grid{0, 0};
+    CoreRangeSet all_cores;
+};
+
+// Build a Program with all CBs allocated and the 3 kernels compiled.
+// TensorAccessorArgs for DRAM-interleaved buffers only encode (IsDram,
+// aligned_page_size) at compile time; both are buffer-instance-independent
+// for our use, so we can reuse this Program across frames whose inputs have
+// different sizes — only DRAM addresses + num_tiles change per frame and are
+// passed via SetRuntimeArgs.
+//
+// CBs and kernels are created on the full compute grid (`ctx.all_cores`).
+// Each core gets its own independent copy of every CB (state, scratch, etc.).
+// Per-frame work distribution happens in process_frame() via
+// split_work_to_cores + SetRuntimeArgs.
+static void build_program_and_workload(DeviceContext& ctx) {
+    Program program = CreateProgram();
+    const CoreRangeSet& cores = ctx.all_cores;
+
+    auto cb_tile = [&](uint32_t id, uint32_t depth) {
+        CircularBufferConfig c(depth * TILE_BYTES_BF16, {{id, DataFormat::Float16_b}});
+        c.set_page_size(id, TILE_BYTES_BF16);
+        CreateCircularBuffer(program, cores, c);
+    };
+    auto cb_small = [&](uint32_t id, uint32_t page_bytes, uint32_t depth, DataFormat fmt) {
+        CircularBufferConfig c(depth * page_bytes, {{id, fmt}});
+        c.set_page_size(id, page_bytes);
+        CreateCircularBuffer(program, cores, c);
+    };
+
+    cb_tile(CB_PX, 2);
+    cb_tile(CB_PY, 2);
+    cb_small(CB_SCALARS, SCALAR_PACK_PAGE_BYTES, 4, DataFormat::Float32);
+    cb_small(CB_TILE_META, META_PAGE_BYTES, 2, DataFormat::UInt32);
+    // Depth must be a multiple of 3 (the per-tile batch size) so no
+    // single push-of-3 ever straddles the CB wrap. Picking 6 keeps two
+    // batches in flight (parity with the previous double-buffering depth).
+    cb_tile(CB_COLOR_OUT, 6);
+
+    cb_tile(CB_DX, 2);
+    cb_tile(CB_DY, 2);
+    cb_tile(CB_DX2, 2);
+    cb_tile(CB_DY2, 2);
+    cb_tile(CB_DXDY, 2);
+    {
+        CircularBufferConfig c(3 * TILE_BYTES_BF16, {{CB_Q, DataFormat::Float16_b}});
+        c.set_page_size(CB_Q, TILE_BYTES_BF16);
+        CreateCircularBuffer(program, cores, c);
+    }
+    cb_tile(CB_POWER, 2);
+    cb_tile(CB_ALPHA, 2);
+
+    cb_tile(CB_CONTRIB, 1);
+    cb_tile(CB_ONE_MINUS_ALPHA, 1);
+    cb_tile(CB_T_TMP, 1);
+
+    cb_tile(CB_COLOR_R_STATE, 1);
+    cb_tile(CB_COLOR_G_STATE, 1);
+    cb_tile(CB_COLOR_B_STATE, 1);
+    cb_tile(CB_T_STATE, 1);
+    cb_tile(CB_SAT_MASK, 1);
+
+    cb_tile(CB_CONST_ZERO, 1);
+    cb_tile(CB_CONST_099, 1);
+    cb_tile(CB_CONST_NEG88, 1);
+
+    // Reader: 5 DRAM-interleaved TensorAccessorArgs for
+    // packs/offsets/px/py/tile_ids. For non-sharded interleaved buffers, the
+    // compile-time args reduce to (IsDram flag, aligned_page_size). Page sizes
+    // are compile-time constants, so this is independent of any specific
+    // buffer instance.
+    std::vector<uint32_t> reader_ct;
+    TensorAccessorArgs::create_dram_interleaved().append_to(reader_ct);
+    TensorAccessorArgs::create_dram_interleaved().append_to(reader_ct);
+    TensorAccessorArgs::create_dram_interleaved().append_to(reader_ct);
+    TensorAccessorArgs::create_dram_interleaved().append_to(reader_ct);
+    TensorAccessorArgs::create_dram_interleaved().append_to(reader_ct);
+    ctx.reader = CreateKernel(
+        program,
+        OVERRIDE_KERNEL_PREFIX "gaussian_splatting/kernels/dataflow/reader_alpha_blend.cpp",
+        cores,
+        DataMovementConfig{
+            .processor = DataMovementProcessor::RISCV_1,
+            .noc = NOC::RISCV_1_default,
+            .compile_args = reader_ct,
+        });
+
+    ctx.compute = CreateKernel(
+        program,
+        OVERRIDE_KERNEL_PREFIX "gaussian_splatting/kernels/compute/alpha_blend_compute.cpp",
+        cores,
+        ComputeConfig{
+            .math_fidelity = MathFidelity::HiFi3,
+            .fp32_dest_acc_en = true,
+            .math_approx_mode = false,
+        });
+
+    // Writer: 2 TensorAccessorArgs for out + tile_ids.
+    std::vector<uint32_t> writer_ct;
+    TensorAccessorArgs::create_dram_interleaved().append_to(writer_ct);
+    TensorAccessorArgs::create_dram_interleaved().append_to(writer_ct);
+    ctx.writer = CreateKernel(
+        program,
+        OVERRIDE_KERNEL_PREFIX "gaussian_splatting/kernels/dataflow/writer_alpha_blend.cpp",
+        cores,
+        DataMovementConfig{
+            .processor = DataMovementProcessor::RISCV_0,
+            .noc = NOC::RISCV_0_default,
+            .compile_args = writer_ct,
+        });
+
+    distributed::MeshCoordinateRange device_range = distributed::MeshCoordinateRange(ctx.mesh_device->shape());
+    ctx.workload.add_program(device_range, std::move(program));
+}
+
+static DeviceContext init_device_context() {
+    DeviceContext ctx;
+    constexpr int device_id = 0;
+    ctx.mesh_device = distributed::MeshDevice::create_unit_mesh(device_id);
+    ctx.cq = &ctx.mesh_device->mesh_command_queue();
+    ctx.grid = ctx.mesh_device->compute_with_storage_grid_size();
+    ctx.all_cores = CoreRangeSet(CoreRange({0, 0}, {ctx.grid.x - 1, ctx.grid.y - 1}));
+    build_program_and_workload(ctx);
+    return ctx;
+}
+
+// ---------------------------------------------------------------------------
+// Per-frame work
+// ---------------------------------------------------------------------------
+
+struct FrameInputs {
+    std::string packs_path;
+    std::string offsets_path;
+    std::string px_path;
+    std::string py_path;
+    std::string out_path;
+    uint32_t image_h;
+    uint32_t image_w;
+};
+
+// Returns the kernel-only elapsed time (EnqueueWriteBuffer start ->
+// EnqueueReadBuffer end) in milliseconds.
+static double process_frame(DeviceContext& ctx, const FrameInputs& f) {
+    const uint32_t image_h = f.image_h;
+    const uint32_t image_w = f.image_w;
+    const uint32_t tiles_x = (image_w + 31) / 32;
+    const uint32_t tiles_y = (image_h + 31) / 32;
+    const uint32_t num_tiles = tiles_x * tiles_y;
 
     std::vector<size_t> packs_shape, offsets_shape, px_shape, py_shape;
-    auto packs_f32 = load_npy_f32(packs_path, packs_shape);
-    auto offsets_f32 = load_npy_f32(offsets_path, offsets_shape);
-    auto px_f32 = load_npy_f32(px_path, px_shape);
-    auto py_f32 = load_npy_f32(py_path, py_shape);
+    auto packs_f32 = load_npy_f32(f.packs_path, packs_shape);
+    auto offsets_f32 = load_npy_f32(f.offsets_path, offsets_shape);
+    auto px_f32 = load_npy_f32(f.px_path, px_shape);
+    auto py_f32 = load_npy_f32(f.py_path, py_shape);
 
-    uint32_t total_entries = static_cast<uint32_t>(packs_shape[0]);
+    const uint32_t total_entries = static_cast<uint32_t>(packs_shape[0]);
 
-    bool pass = true;
-    try {
-        constexpr int device_id = 0;
-        std::shared_ptr<distributed::MeshDevice> mesh_device = distributed::MeshDevice::create_unit_mesh(device_id);
-        distributed::MeshCommandQueue& cq = mesh_device->mesh_command_queue();
+    // Per-frame DRAM allocation. tt-metal Buffers are RAII via shared_ptr;
+    // they free on scope exit at the end of this function.
+    auto make_dram = [&](size_t bytes, size_t page_bytes) {
+        distributed::ReplicatedBufferConfig rc{.size = bytes};
+        distributed::DeviceLocalBufferConfig lc{.page_size = page_bytes, .buffer_type = BufferType::DRAM};
+        return distributed::MeshBuffer::create(rc, lc, ctx.mesh_device.get());
+    };
 
-        auto make_dram = [&](size_t bytes, size_t page_bytes) {
-            distributed::ReplicatedBufferConfig rc{.size = bytes};
-            distributed::DeviceLocalBufferConfig lc{.page_size = page_bytes, .buffer_type = BufferType::DRAM};
-            return distributed::MeshBuffer::create(rc, lc, mesh_device.get());
-        };
+    auto packs_dram = make_dram(static_cast<size_t>(total_entries) * SCALAR_PACK_PAGE_BYTES, SCALAR_PACK_PAGE_BYTES);
+    auto offsets_dram = make_dram(offsets_f32.size() * 4, 4);
+    auto px_dram = make_dram(static_cast<size_t>(num_tiles) * TILE_BYTES_BF16, TILE_BYTES_BF16);
+    auto py_dram = make_dram(static_cast<size_t>(num_tiles) * TILE_BYTES_BF16, TILE_BYTES_BF16);
+    auto out_dram = make_dram(static_cast<size_t>(num_tiles) * 3 * TILE_BYTES_BF16, TILE_BYTES_BF16);
 
-        auto packs_dram = make_dram(static_cast<size_t>(total_entries) * SCALAR_PACK_PAGE_BYTES, SCALAR_PACK_PAGE_BYTES);
-        auto offsets_dram = make_dram(offsets_f32.size() * 4, 4);
-        auto px_dram = make_dram(static_cast<size_t>(num_tiles) * TILE_BYTES_BF16, TILE_BYTES_BF16);
-        auto py_dram = make_dram(static_cast<size_t>(num_tiles) * TILE_BYTES_BF16, TILE_BYTES_BF16);
-        auto out_dram = make_dram(static_cast<size_t>(num_tiles) * 3 * TILE_BYTES_BF16, TILE_BYTES_BF16);
+    // ---------------------------------------------------------------------
+    // LPT load balancing
+    // ---------------------------------------------------------------------
+    // Tiles vary wildly in Gaussian count (cost). Sort tiles descending by
+    // cost and greedily assign each to the currently least-loaded core. This
+    // is a 4/3-approximation of the optimal makespan; usually within a few
+    // percent of perfect for our workload sizes. Result is a per-core list
+    // of tile IDs that the reader/writer kernels look up at runtime.
+    const uint32_t num_cores = ctx.grid.x * ctx.grid.y;
 
-        // Encode attribute packs into 64-byte pages (9 fp32 -> 36 bytes, 28 bytes zero-padded).
-        std::vector<uint32_t> packs_payload((static_cast<size_t>(total_entries) * SCALAR_PACK_PAGE_BYTES) / 4, 0);
-        for (uint32_t e = 0; e < total_entries; e++) {
-            std::memcpy(
-                reinterpret_cast<uint8_t*>(packs_payload.data()) + static_cast<size_t>(e) * SCALAR_PACK_PAGE_BYTES,
-                &packs_f32[e * 9],
-                9 * 4);
-        }
-
-        // Encode px/py as bf16 tiles.
-        std::vector<uint16_t> px_bf16(static_cast<size_t>(num_tiles) * TILE_H * TILE_W);
-        std::vector<uint16_t> py_bf16(static_cast<size_t>(num_tiles) * TILE_H * TILE_W);
+    std::vector<std::vector<uint32_t>> per_core_tile_ids(num_cores);
+    {
+        std::vector<std::pair<uint32_t, uint32_t>> cost_id;  // (cost, tile_id)
+        cost_id.reserve(num_tiles);
         for (uint32_t t = 0; t < num_tiles; t++) {
-            auto px_tile = fp32_tile_to_bf16(&px_f32[t * TILE_H * TILE_W]);
-            auto py_tile = fp32_tile_to_bf16(&py_f32[t * TILE_H * TILE_W]);
-            std::memcpy(&px_bf16[t * TILE_H * TILE_W], px_tile.data(), TILE_BYTES_BF16);
-            std::memcpy(&py_bf16[t * TILE_H * TILE_W], py_tile.data(), TILE_BYTES_BF16);
+            uint32_t cost = static_cast<uint32_t>(offsets_f32[t + 1] - offsets_f32[t]);
+            cost_id.emplace_back(cost, t);
         }
+        std::sort(cost_id.begin(), cost_id.end(), std::greater<>());
 
-        // Cast offsets fp32 -> uint32.
-        std::vector<uint32_t> offsets_u32(offsets_f32.size());
-        for (size_t i = 0; i < offsets_f32.size(); i++) {
-            offsets_u32[i] = static_cast<uint32_t>(offsets_f32[i]);
+        std::vector<uint64_t> core_load(num_cores, 0);
+        for (const auto& [cost, id] : cost_id) {
+            auto min_it = std::min_element(core_load.begin(), core_load.end());
+            uint32_t c = static_cast<uint32_t>(std::distance(core_load.begin(), min_it));
+            per_core_tile_ids[c].push_back(id);
+            core_load[c] += cost;
         }
+    }
 
-        distributed::EnqueueWriteMeshBuffer(cq, packs_dram, packs_payload);
-        distributed::EnqueueWriteMeshBuffer(cq, offsets_dram, offsets_u32);
-        distributed::EnqueueWriteMeshBuffer(cq, px_dram, px_bf16);
-        distributed::EnqueueWriteMeshBuffer(cq, py_dram, py_bf16);
+    // Concatenate per-core lists into one DRAM buffer (uint32 elements).
+    // Per-core (start, count) gives each core's slice.
+    std::vector<uint32_t> tile_id_buffer;
+    std::vector<uint32_t> per_core_offset(num_cores, 0);
+    std::vector<uint32_t> per_core_count(num_cores, 0);
+    tile_id_buffer.reserve(num_tiles);
+    for (uint32_t c = 0; c < num_cores; c++) {
+        per_core_offset[c] = static_cast<uint32_t>(tile_id_buffer.size());
+        per_core_count[c]  = static_cast<uint32_t>(per_core_tile_ids[c].size());
+        tile_id_buffer.insert(
+            tile_id_buffer.end(),
+            per_core_tile_ids[c].begin(),
+            per_core_tile_ids[c].end());
+    }
 
-        Program program = CreateProgram();
-        constexpr CoreCoord core{0, 0};
+    // Allocate a DRAM buffer for the tile-ID list. Page size 64B is a safe
+    // minimum for NoC alignment (matches our other small buffers). When
+    // num_tiles==0 we still allocate a 64B placeholder so the
+    // TensorAccessor config has a valid base address.
+    constexpr size_t TILE_IDS_PAGE_BYTES = 64;
+    const size_t tile_ids_bytes_payload = tile_id_buffer.size() * sizeof(uint32_t);
+    const size_t tile_ids_bytes = std::max<size_t>(tile_ids_bytes_payload, TILE_IDS_PAGE_BYTES);
+    auto tile_ids_dram = make_dram(tile_ids_bytes, TILE_IDS_PAGE_BYTES);
+    // Pad upload to a whole page so DRAM write covers the allocated size.
+    std::vector<uint32_t> tile_id_buffer_padded(tile_ids_bytes / sizeof(uint32_t), 0);
+    std::copy(tile_id_buffer.begin(), tile_id_buffer.end(), tile_id_buffer_padded.begin());
 
-        // Tile-sized circular buffers (Float16_b).
-        auto cb_tile = [&](uint32_t id, uint32_t depth) {
-            CircularBufferConfig c(depth * TILE_BYTES_BF16, {{id, DataFormat::Float16_b}});
-            c.set_page_size(id, TILE_BYTES_BF16);
-            CreateCircularBuffer(program, core, c);
-        };
-        // Small (sub-tile) circular buffers.
-        auto cb_small = [&](uint32_t id, uint32_t page_bytes, uint32_t depth, DataFormat fmt) {
-            CircularBufferConfig c(depth * page_bytes, {{id, fmt}});
-            c.set_page_size(id, page_bytes);
-            CreateCircularBuffer(program, core, c);
-        };
+    // Encode attribute packs into 64-byte pages (9 fp32 -> 36 bytes, 28 bytes zero-padded).
+    std::vector<uint32_t> packs_payload((static_cast<size_t>(total_entries) * SCALAR_PACK_PAGE_BYTES) / 4, 0);
+    for (uint32_t e = 0; e < total_entries; e++) {
+        std::memcpy(
+            reinterpret_cast<uint8_t*>(packs_payload.data()) + static_cast<size_t>(e) * SCALAR_PACK_PAGE_BYTES,
+            &packs_f32[e * 9],
+            9 * 4);
+    }
 
-        cb_tile(CB_PX, 2);
-        cb_tile(CB_PY, 2);
-        cb_small(CB_SCALARS, SCALAR_PACK_PAGE_BYTES, 4, DataFormat::Float32);
-        cb_small(CB_TILE_META, META_PAGE_BYTES, 2, DataFormat::UInt32);
-        // Depth must be a multiple of 3 (the per-tile batch size) so no
-        // single push-of-3 ever straddles the CB wrap. Otherwise the writer's
-        // `read_ptr += tile_bytes` arithmetic across the 3 channels is wrong:
-        // after the wrap the second/third NoC write would source from
-        // out-of-CB L1 instead of slots {0,1} or {0}. Picking 6 keeps two
-        // batches in flight (parity with the previous double-buffering depth).
-        cb_tile(CB_COLOR_OUT, 6);
+    // Encode px/py as bf16 tiles.
+    std::vector<uint16_t> px_bf16(static_cast<size_t>(num_tiles) * TILE_H * TILE_W);
+    std::vector<uint16_t> py_bf16(static_cast<size_t>(num_tiles) * TILE_H * TILE_W);
+    for (uint32_t t = 0; t < num_tiles; t++) {
+        auto px_tile = fp32_tile_to_bf16(&px_f32[t * TILE_H * TILE_W]);
+        auto py_tile = fp32_tile_to_bf16(&py_f32[t * TILE_H * TILE_W]);
+        std::memcpy(&px_bf16[t * TILE_H * TILE_W], px_tile.data(), TILE_BYTES_BF16);
+        std::memcpy(&py_bf16[t * TILE_H * TILE_W], py_tile.data(), TILE_BYTES_BF16);
+    }
 
-        // Scratch CBs for v1a compute (depth 2 each, single-tile pages).
-        cb_tile(CB_DX, 2);
-        cb_tile(CB_DY, 2);
-        cb_tile(CB_DX2, 2);
-        cb_tile(CB_DY2, 2);
-        cb_tile(CB_DXDY, 2);
-        // CB_Q packs 3 tiles per push (a*dx2, c*dy2, 2b*dxdy).
-        {
-            CircularBufferConfig c(3 * TILE_BYTES_BF16, {{CB_Q, DataFormat::Float16_b}});
-            c.set_page_size(CB_Q, TILE_BYTES_BF16);
-            CreateCircularBuffer(program, core, c);
+    std::vector<uint32_t> offsets_u32(offsets_f32.size());
+    for (size_t i = 0; i < offsets_f32.size(); i++) {
+        offsets_u32[i] = static_cast<uint32_t>(offsets_f32[i]);
+    }
+
+    // Pull the program back out of the workload so we can refresh its runtime args.
+    auto& programs = ctx.workload.get_programs();
+    auto it = programs.find(distributed::MeshCoordinateRange(ctx.mesh_device->shape()));
+    if (it == programs.end()) {
+        throw std::runtime_error("workload missing program for device range");
+    }
+    Program& program = it->second;
+
+    // LPT-balanced per-core work distribution. Each core processes its own
+    // list of tile IDs (potentially non-contiguous) drawn from a slice of
+    // the concatenated tile_id_buffer in DRAM.
+
+    const uint32_t packs_addr    = static_cast<uint32_t>(packs_dram->address());
+    const uint32_t offsets_addr  = static_cast<uint32_t>(offsets_dram->address());
+    const uint32_t px_addr       = static_cast<uint32_t>(px_dram->address());
+    const uint32_t py_addr       = static_cast<uint32_t>(py_dram->address());
+    const uint32_t out_addr      = static_cast<uint32_t>(out_dram->address());
+    const uint32_t tile_ids_addr = static_cast<uint32_t>(tile_ids_dram->address());
+
+    uint32_t core_index = 0;
+    for (const auto& range : ctx.all_cores.ranges()) {
+        for (auto x = range.start_coord.x; x <= range.end_coord.x; x++) {
+            for (auto y = range.start_coord.y; y <= range.end_coord.y; y++) {
+                CoreCoord core{x, y};
+                const uint32_t start = per_core_offset[core_index];
+                const uint32_t count = per_core_count[core_index];
+
+                SetRuntimeArgs(
+                    program,
+                    ctx.reader,
+                    core,
+                    {
+                        packs_addr,
+                        offsets_addr,
+                        px_addr,
+                        py_addr,
+                        tile_ids_addr,
+                        /*tile_ids_start=*/start,
+                        /*tile_ids_count=*/count,
+                    });
+                SetRuntimeArgs(program, ctx.compute, core, {count});
+                SetRuntimeArgs(
+                    program,
+                    ctx.writer,
+                    core,
+                    {
+                        out_addr,
+                        tile_ids_addr,
+                        /*tile_ids_start=*/start,
+                        /*tile_ids_count=*/count,
+                    });
+                core_index++;
+            }
         }
-        cb_tile(CB_POWER, 2);
-        cb_tile(CB_ALPHA, 2);
+    }
 
-        // v1b additional scratch CBs (depth 1).
-        cb_tile(CB_CONTRIB, 1);
-        cb_tile(CB_ONE_MINUS_ALPHA, 1);
-        cb_tile(CB_T_TMP, 1);
+    // ---- KERNEL TIMING: EnqueueWriteBuffer start -> EnqueueReadBuffer end ----
+    auto t_start = std::chrono::steady_clock::now();
 
-        // v1b state CBs (depth 1, persistent across Gaussian loop).
-        cb_tile(CB_COLOR_R_STATE, 1);
-        cb_tile(CB_COLOR_G_STATE, 1);
-        cb_tile(CB_COLOR_B_STATE, 1);
-        cb_tile(CB_T_STATE, 1);
-        cb_tile(CB_SAT_MASK, 1);
+    distributed::EnqueueWriteMeshBuffer(*ctx.cq, packs_dram, packs_payload);
+    distributed::EnqueueWriteMeshBuffer(*ctx.cq, offsets_dram, offsets_u32);
+    distributed::EnqueueWriteMeshBuffer(*ctx.cq, px_dram, px_bf16);
+    distributed::EnqueueWriteMeshBuffer(*ctx.cq, py_dram, py_bf16);
+    distributed::EnqueueWriteMeshBuffer(*ctx.cq, tile_ids_dram, tile_id_buffer_padded);
 
-        // Constant CBs (depth 1; preloaded once by compute, never popped).
-        cb_tile(CB_CONST_ZERO, 1);
-        cb_tile(CB_CONST_099, 1);
-        cb_tile(CB_CONST_NEG88, 1);
+    distributed::EnqueueMeshWorkload(*ctx.cq, ctx.workload, /*blocking=*/false);
 
-        // Reader: 4 TensorAccessorArgs in order packs, offsets, px, py.
-        std::vector<uint32_t> reader_ct;
-        TensorAccessorArgs(*packs_dram).append_to(reader_ct);
-        TensorAccessorArgs(*offsets_dram).append_to(reader_ct);
-        TensorAccessorArgs(*px_dram).append_to(reader_ct);
-        TensorAccessorArgs(*py_dram).append_to(reader_ct);
-        auto reader = CreateKernel(
-            program,
-            OVERRIDE_KERNEL_PREFIX "gaussian_splatting/kernels/dataflow/reader_alpha_blend.cpp",
-            core,
-            DataMovementConfig{
-                .processor = DataMovementProcessor::RISCV_1,
-                .noc = NOC::RISCV_1_default,
-                .compile_args = reader_ct,
-            });
+    std::vector<uint16_t> result_bf16(static_cast<size_t>(num_tiles) * 3 * TILE_H * TILE_W);
+    distributed::EnqueueReadMeshBuffer(*ctx.cq, result_bf16, out_dram, /*blocking=*/true);
 
-        // Compute: HiFi3, !approx, fp32 dest accumulation.
-        auto compute = CreateKernel(
-            program,
-            OVERRIDE_KERNEL_PREFIX "gaussian_splatting/kernels/compute/alpha_blend_compute.cpp",
-            core,
-            ComputeConfig{
-                .math_fidelity = MathFidelity::HiFi3,
-                .fp32_dest_acc_en = true,
-                .math_approx_mode = false,
-            });
+    auto t_end = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    // -------------------------------------------------------------------------
 
-        // Writer: 1 TensorAccessorArgs for the output buffer.
-        std::vector<uint32_t> writer_ct;
-        TensorAccessorArgs(*out_dram).append_to(writer_ct);
-        auto writer = CreateKernel(
-            program,
-            OVERRIDE_KERNEL_PREFIX "gaussian_splatting/kernels/dataflow/writer_alpha_blend.cpp",
-            core,
-            DataMovementConfig{
-                .processor = DataMovementProcessor::RISCV_0,
-                .noc = NOC::RISCV_0_default,
-                .compile_args = writer_ct,
-            });
-
-        SetRuntimeArgs(
-            program,
-            reader,
-            core,
-            {
-                static_cast<uint32_t>(packs_dram->address()),
-                static_cast<uint32_t>(offsets_dram->address()),
-                static_cast<uint32_t>(px_dram->address()),
-                static_cast<uint32_t>(py_dram->address()),
-                /*first_tile_id=*/0u,
-                /*num_tiles=*/num_tiles,
-            });
-        SetRuntimeArgs(program, compute, core, {num_tiles});
-        SetRuntimeArgs(
-            program,
-            writer,
-            core,
-            {
-                static_cast<uint32_t>(out_dram->address()),
-                /*first_tile_id=*/0u,
-                /*num_tiles=*/num_tiles,
-            });
-
-        distributed::MeshWorkload workload;
-        distributed::MeshCoordinateRange device_range = distributed::MeshCoordinateRange(mesh_device->shape());
-        workload.add_program(device_range, std::move(program));
-        distributed::EnqueueMeshWorkload(cq, workload, /*blocking=*/false);
-        distributed::Finish(cq);
-
-        // Read back output buffer (bf16 tiles).
-        std::vector<uint16_t> result_bf16(static_cast<size_t>(num_tiles) * 3 * TILE_H * TILE_W);
-        distributed::EnqueueReadMeshBuffer(cq, result_bf16, out_dram, /*blocking=*/true);
-
-        // Convert bf16 tiles -> row-major fp32 (H, W, 3).
-        std::vector<float> img(static_cast<size_t>(image_h) * image_w * 3, 0.0f);
-        for (uint32_t t = 0; t < num_tiles; t++) {
-            uint32_t ty = t / tiles_x;
-            uint32_t tx = t % tiles_x;
-            for (uint32_t ch = 0; ch < 3; ch++) {
-                auto fp = bf16_tile_to_fp32(&result_bf16[(3 * t + ch) * TILE_H * TILE_W]);
-                for (uint32_t i = 0; i < TILE_H; i++) {
-                    for (uint32_t j = 0; j < TILE_W; j++) {
-                        uint32_t y = ty * TILE_H + i;
-                        uint32_t x = tx * TILE_W + j;
-                        if (y < image_h && x < image_w) {
-                            img[(static_cast<size_t>(y) * image_w + x) * 3 + ch] = fp[i * TILE_W + j];
-                        }
+    // Convert bf16 tiles -> row-major fp32 (H, W, 3).
+    std::vector<float> img(static_cast<size_t>(image_h) * image_w * 3, 0.0f);
+    for (uint32_t t = 0; t < num_tiles; t++) {
+        uint32_t ty = t / tiles_x;
+        uint32_t tx = t % tiles_x;
+        for (uint32_t ch = 0; ch < 3; ch++) {
+            auto fp = bf16_tile_to_fp32(&result_bf16[(3 * t + ch) * TILE_H * TILE_W]);
+            for (uint32_t i = 0; i < TILE_H; i++) {
+                for (uint32_t j = 0; j < TILE_W; j++) {
+                    uint32_t y = ty * TILE_H + i;
+                    uint32_t x = tx * TILE_W + j;
+                    if (y < image_h && x < image_w) {
+                        img[(static_cast<size_t>(y) * image_w + x) * 3 + ch] = fp[i * TILE_W + j];
                     }
                 }
             }
         }
+    }
 
-        save_npy_f32(out_path, img, {image_h, image_w, 3});
-        std::cout << "Wrote " << out_path << std::endl;
-        pass &= mesh_device->close();
+    save_npy_f32(f.out_path, img, {image_h, image_w, 3});
+    return ms;
+}
+
+// ---------------------------------------------------------------------------
+// Daemon mode
+// ---------------------------------------------------------------------------
+
+static int run_daemon() {
+    DeviceContext ctx;
+    try {
+        ctx = init_device_context();
+    } catch (const std::exception& e) {
+        std::cerr << "daemon init failed: " << e.what() << std::endl;
+        return 1;
+    }
+
+    std::cout << "READY" << std::endl;
+    std::cout.flush();
+
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        if (line == "QUIT" || line == "quit") {
+            break;
+        }
+        if (line.empty()) {
+            continue;
+        }
+        // FRAME H W packs offsets px py out
+        std::istringstream iss(line);
+        std::string cmd;
+        iss >> cmd;
+        if (cmd != "FRAME") {
+            std::cout << "ERR unknown command: " << cmd << std::endl;
+            std::cout.flush();
+            continue;
+        }
+        FrameInputs f;
+        if (!(iss >> f.image_h >> f.image_w >> f.packs_path >> f.offsets_path >> f.px_path >> f.py_path >> f.out_path)) {
+            std::cout << "ERR malformed FRAME line" << std::endl;
+            std::cout.flush();
+            continue;
+        }
+        try {
+            double ms = process_frame(ctx, f);
+            std::cout << "OK " << std::fixed << std::setprecision(2) << ms << std::endl;
+            std::cout.flush();
+        } catch (const std::exception& e) {
+            std::cout << "ERR " << e.what() << std::endl;
+            std::cout.flush();
+        }
+    }
+
+    bool ok = true;
+    if (ctx.mesh_device) {
+        ok = ctx.mesh_device->close();
+    }
+    return ok ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
+// Single-shot mode (original CLI)
+// ---------------------------------------------------------------------------
+
+static int run_single_shot(int argc, char** argv) {
+    if (argc < 6) {
+        std::cerr << "Usage: " << argv[0] << " packs.npy offsets.npy px.npy py.npy output.npy [H] [W]\n"
+                  << "       " << argv[0] << " --daemon\n";
+        return 1;
+    }
+    FrameInputs f;
+    f.packs_path = argv[1];
+    f.offsets_path = argv[2];
+    f.px_path = argv[3];
+    f.py_path = argv[4];
+    f.out_path = argv[5];
+    f.image_h = argc > 6 ? static_cast<uint32_t>(std::stoi(argv[6])) : 32;
+    f.image_w = argc > 7 ? static_cast<uint32_t>(std::stoi(argv[7])) : 32;
+
+    bool pass = true;
+    DeviceContext ctx;
+    try {
+        ctx = init_device_context();
+        process_frame(ctx, f);
+        std::cout << "Wrote " << f.out_path << std::endl;
+        if (ctx.mesh_device) {
+            pass &= ctx.mesh_device->close();
+        }
     } catch (const std::exception& e) {
         std::cerr << "Run failed with exception: " << e.what() << std::endl;
         throw;
     }
-
     return pass ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+int main(int argc, char** argv) {
+    if (argc >= 2 && std::string(argv[1]) == "--daemon") {
+        return run_daemon();
+    }
+    return run_single_shot(argc, argv);
 }

@@ -37,6 +37,7 @@ class GaussianViewer:
         port: int = 8080,
         backend: str = "cpu",
         max_resolution: int = 640,
+        adaptive_resolution: bool = False,
         verbose: bool = False,
     ):
         self.gaussians = gaussians
@@ -46,6 +47,11 @@ class GaussianViewer:
         # the viewer feels frozen. Stretching the displayed image is fine for
         # interactive preview.
         self.max_resolution = max_resolution
+        # If False (default), always render at max_resolution on the longest
+        # dim regardless of nerfview's adaptive-downsample requests. Looks
+        # better, dragging is choppier. If True, honor nerfview's smaller
+        # requests during camera movement (smoother drag, pixelated previews).
+        self.adaptive_resolution = adaptive_resolution
         self.verbose = verbose
         if backend == "kernel":
             self._kernel = KernelBackend(verbose=verbose)
@@ -83,10 +89,13 @@ class GaussianViewer:
             client.camera.look_at = center
 
         self._running = False
+        flags = [f"backend={backend}", f"max_resolution={max_resolution}"]
+        if adaptive_resolution:
+            flags.append("adaptive_resolution")
+        if verbose:
+            flags.append("verbose")
         print(
-            f"Viewer running at http://localhost:{port} "
-            f"(backend={backend}, max_resolution={max_resolution}"
-            f"{', verbose' if verbose else ''})",
+            f"Viewer running at http://localhost:{port} ({', '.join(flags)})",
             flush=True,
         )
 
@@ -96,10 +105,18 @@ class GaussianViewer:
         """Pick (W, H) for this frame.
 
         nerfview adapts its requests on the fly: small dims during camera
-        movement (low_move state), full viewer_res when static. We honor
-        whatever it asks for, capped at max_resolution on the longest dim
-        to keep prepare_kernel_inputs from spending seconds at 1920x1080,
-        and snapped to multiples of 32 so the kernel gets whole tiles.
+        movement (low_move state), full viewer_res when static. We use
+        `req_W / req_H` only as the aspect ratio; the actual render size
+        depends on `adaptive_resolution`:
+
+          - False (default): always render at max_resolution on the longest
+            dim (preserving aspect). Every frame is full-quality; dragging
+            is choppier.
+          - True: honor whatever nerfview asks for, capped at max_resolution
+            on the longest dim. Smooth dragging via downsampled previews;
+            full quality when static.
+
+        Snaps both dims to multiples of 32 so the kernel gets whole tiles.
 
         Returns (req_W, req_H, W, H) — the original request alongside the
         resolved size, useful for logging.
@@ -114,11 +131,23 @@ class GaussianViewer:
         if req_W <= 0 or req_H <= 0:
             return req_W, req_H, max(req_W, 1), max(req_H, 1)
 
-        W, H = req_W, req_H
-        if max(W, H) > self.max_resolution:
-            scale = self.max_resolution / max(W, H)
-            W = int(W * scale)
-            H = int(H * scale)
+        if self.adaptive_resolution:
+            # Honor nerfview's adaptive size, capped from above.
+            W, H = req_W, req_H
+            if max(W, H) > self.max_resolution:
+                scale = self.max_resolution / max(W, H)
+                W = int(W * scale)
+                H = int(H * scale)
+        else:
+            # Always target max_resolution on the longest dim, keep aspect.
+            aspect = req_W / req_H
+            if aspect >= 1.0:
+                W = self.max_resolution
+                H = int(self.max_resolution / aspect)
+            else:
+                H = self.max_resolution
+                W = int(self.max_resolution * aspect)
+
         W = max(TILE_SIZE, (W // TILE_SIZE) * TILE_SIZE)
         H = max(TILE_SIZE, (H // TILE_SIZE) * TILE_SIZE)
         return req_W, req_H, W, H

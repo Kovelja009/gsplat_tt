@@ -127,10 +127,22 @@ class KernelBackend:
         # mid-flight in render(), and pulling the directory out from under it
         # produces a confusing FileNotFoundError on Ctrl+C. /tmp is cleaned by
         # the OS on reboot; leaving the dir is harmless.
+        #
+        # Process cleanup: try graceful QUIT first; if the daemon doesn't
+        # exit promptly, hard-kill so the Wormhole device is released.
+        # Leaving a daemon orphaned holds the device and breaks the next
+        # invocation (the tt-metal driver hangs trying to acquire it).
         if self._proc.poll() is None:
             try:
                 self._proc.stdin.write("QUIT\n")
                 self._proc.stdin.flush()
-                self._proc.wait(timeout=5)
             except Exception:
+                pass
+            try:
+                self._proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
                 self._proc.kill()
+                try:
+                    self._proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    pass

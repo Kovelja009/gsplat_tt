@@ -24,12 +24,21 @@ def main():
     parser.add_argument(
         "--max-resolution",
         type=int,
-        default=640,
+        default=1280,
         help=(
             "Cap longest dim of the render (preserving aspect ratio, rounded "
             "down to multiple of 32). Prevents the kernel backend from "
             "spending seconds in prepare_kernel_inputs at typical browser "
-            "resolutions. Default: 640."
+            "resolutions. Default: 1280."
+        ),
+    )
+    parser.add_argument(
+        "--adaptive-resolution",
+        action="store_true",
+        help=(
+            "Enable nerfview's adaptive low-res preview during camera movement "
+            "(smoother drag at the cost of pixelated frames). Default: off, "
+            "every frame is rendered at max-resolution."
         ),
     )
     parser.add_argument(
@@ -49,6 +58,7 @@ def main():
         port=args.port,
         backend=args.backend,
         max_resolution=args.max_resolution,
+        adaptive_resolution=args.adaptive_resolution,
         verbose=args.verbose,
     )
     viewer.run()

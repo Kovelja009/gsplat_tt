@@ -40,10 +40,11 @@
 // Compile-time args: 5 TensorAccessorArgs in order
 //   packs, tile_offsets, px, py, tile_ids.
 
-// Max per-core tile IDs we cache in L1. The 64-core / 400-tile case puts
-// ~6-7 tiles on each core after LPT; even with severe imbalance from
-// pathological cost distributions we stay well under 64. 256 bytes total.
-constexpr uint32_t MAX_TILE_IDS_PER_CORE = 64;
+// Max per-core tile IDs we cache in L1. Sized to handle a 4K render
+// (120x68 = 8160 tiles, ~128/core after round-robin balancing). At 1080p
+// (60x34 = 2040 tiles) average is ~32/core, leaving plenty of headroom.
+// Cost: 1024 bytes per core (still trivial against the 1.5 MB total L1).
+constexpr uint32_t MAX_TILE_IDS_PER_CORE = 256;
 
 void kernel_main() {
     uint32_t packs_addr        = get_arg_val<uint32_t>(0);

@@ -32,6 +32,11 @@ def main():
             "resolutions. Default: 640."
         ),
     )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Print per-frame stage timing (render-enter / render-mid / kernel-pre / kernel-post / render).",
+    )
     args = parser.parse_args()
 
     print(f"Loading Gaussians from {args.ply_path}...")
@@ -44,6 +49,7 @@ def main():
         port=args.port,
         backend=args.backend,
         max_resolution=args.max_resolution,
+        verbose=args.verbose,
     )
     viewer.run()
 

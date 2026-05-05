@@ -410,36 +410,70 @@ def prepare_kernel_inputs(
     gids_np = sorted_gaussian_ids.numpy()
     ranges_np = tile_ranges.numpy()
 
-    # Flatten (tile_id, g_idx) pairs and build attribute_packs in sorted order
-    total_entries = int((ranges_np[:, 1] - ranges_np[:, 0]).sum())
+    # Build attribute_packs by a single gather over sorted_gaussian_ids.
+    # The previous implementation iterated tile-by-tile in Python and built one
+    # 9-element list per entry — at 45K entries that's ~250 ms of pure
+    # interpreter overhead. The flat array is already in the correct order
+    # (sort_and_bin sorts by tile_id then depth), so a per-column gather is
+    # equivalent and ~100x faster.
+    total_entries = gids_np.shape[0]
+    attribute_packs = np.empty((total_entries, 9), dtype=np.float32)
+    attribute_packs[:, 0] = means_np[gids_np, 0]
+    attribute_packs[:, 1] = means_np[gids_np, 1]
+    attribute_packs[:, 2] = cov_inv_a[gids_np]
+    attribute_packs[:, 3] = 2.0 * cov_inv_b[gids_np]
+    attribute_packs[:, 4] = cov_inv_c[gids_np]
+    attribute_packs[:, 5] = colors_np[gids_np, 0]
+    attribute_packs[:, 6] = colors_np[gids_np, 1]
+    attribute_packs[:, 7] = colors_np[gids_np, 2]
+    attribute_packs[:, 8] = opacities_np[gids_np]
 
-    attribute_packs = np.zeros((total_entries, 9), dtype=np.float32)
+    # tile_offsets: cumulative count up to each tile, plus a final total.
+    # Equivalent to walking tile_ranges in order, since sort_and_bin produces
+    # contiguous ranges for non-empty tiles and (0, 0) for empties.
+    counts = (ranges_np[:, 1] - ranges_np[:, 0]).astype(np.uint32)
     tile_offsets = np.zeros(num_tiles + 1, dtype=np.uint32)
+    tile_offsets[1:] = np.cumsum(counts)
 
-    write_pos = 0
-    for tile_id in range(num_tiles):
-        start, end = int(ranges_np[tile_id, 0]), int(ranges_np[tile_id, 1])
-        tile_offsets[tile_id] = write_pos
-        for idx in range(start, end):
-            g = gids_np[idx]
-            attribute_packs[write_pos] = [
-                means_np[g, 0], means_np[g, 1],
-                cov_inv_a[g], 2.0 * cov_inv_b[g], cov_inv_c[g],
-                colors_np[g, 0], colors_np[g, 1], colors_np[g, 2],
-                opacities_np[g],
-            ]
-            write_pos += 1
-    tile_offsets[num_tiles] = write_pos
-
-    # Build px/py tiles
-    px_tiles = np.zeros((num_tiles, 32, 32), dtype=np.float32)
-    py_tiles = np.zeros((num_tiles, 32, 32), dtype=np.float32)
-    for tile_id in range(num_tiles):
-        ty = tile_id // tiles_x
-        tx = tile_id % tiles_x
-        for j in range(32):
-            for i in range(32):
-                px_tiles[tile_id, i, j] = tx * 32 + j + 0.5
-                py_tiles[tile_id, i, j] = ty * 32 + i + 0.5
+    # px/py grids depend only on (H, W) — cache them per resolution. During
+    # interactive viewing the same resolution is reused thousands of times;
+    # in benchmark runs each scene/resolution combo computes once.
+    px_tiles, py_tiles = _get_px_py_grids(image_height, image_width)
 
     return attribute_packs, tile_offsets, px_tiles, py_tiles
+
+
+# Cache of (px_tiles, py_tiles) keyed by (image_height, image_width).
+# Each entry is ~num_tiles * 32 * 32 * 4 * 2 bytes — at 640x640 that's ~3 MB.
+# Bounded by the small set of distinct resolutions an interactive session
+# produces, so a plain dict is fine (no LRU needed in practice).
+_px_py_cache: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
+
+
+def _get_px_py_grids(image_height: int, image_width: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return (px_tiles, py_tiles) of shape (num_tiles, 32, 32) — cached.
+
+    Each tile (ty, tx) has:
+        px[i, j] = tx * 32 + j + 0.5
+        py[i, j] = ty * 32 + i + 0.5
+    in global screen coordinates (independent of camera and Gaussians).
+    """
+    key = (image_height, image_width)
+    cached = _px_py_cache.get(key)
+    if cached is not None:
+        return cached
+
+    tiles_x = (image_width + 31) // 32
+    tiles_y = (image_height + 31) // 32
+    num_tiles = tiles_x * tiles_y
+    tids = np.arange(num_tiles, dtype=np.int32)
+    ty = (tids // tiles_x).astype(np.float32)
+    tx = (tids % tiles_x).astype(np.float32)
+    i_grid = np.arange(32, dtype=np.float32)
+    j_grid = np.arange(32, dtype=np.float32)
+    px_tiles = np.empty((num_tiles, 32, 32), dtype=np.float32)
+    py_tiles = np.empty((num_tiles, 32, 32), dtype=np.float32)
+    px_tiles[:] = tx[:, None, None] * 32.0 + j_grid[None, None, :] + 0.5
+    py_tiles[:] = ty[:, None, None] * 32.0 + i_grid[None, :, None] + 0.5
+    _px_py_cache[key] = (px_tiles, py_tiles)
+    return px_tiles, py_tiles

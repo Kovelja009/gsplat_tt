@@ -2,21 +2,21 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// Task 2.5 v1b host driver for the gaussian_splatting alpha-blend pipeline.
+// Host driver for the gaussian_splatting alpha-blend kernel.
 //
 // CLI signatures:
 //   metal_example_gaussian_splatting packs.npy offsets.npy px.npy py.npy output.npy [H] [W]
 //   metal_example_gaussian_splatting --daemon
 //
-// Single-shot mode (the original interface): loads four .npy fixtures, opens
-// the device, JIT-compiles kernels, runs once, writes the output, exits.
+// Single-shot mode: loads four .npy fixtures, opens the device, JIT-compiles
+// kernels, runs once, writes the output, exits. Used by tests and benchmarks.
 //
-// Daemon mode: opens the device + JIT-compiles kernels once. Reads
-// "FRAME H W packs.npy offsets.npy px.npy py.npy out.npy" lines from stdin in
-// a loop, processes each frame (per-frame DRAM realloc + new runtime args),
-// prints "OK <ms>" with kernel-only elapsed time, and exits cleanly on
-// EOF or "QUIT". This keeps the ~3s init/JIT cost out of the per-frame path,
-// enabling interactive viewer rates and meaningful per-frame perf measurement.
+// Daemon mode: opens the device + JIT-compiles kernels once, then reads
+// "FRAME H W packs.npy offsets.npy px.npy py.npy out.npy" lines from stdin
+// in a loop, processes each frame (per-frame DRAM realloc + new runtime
+// args), prints "OK <ms>" with kernel-only elapsed time, and exits on
+// EOF or "QUIT". Used by the interactive viewer to keep the ~3s device
+// init + JIT cost off the per-frame path.
 
 #include <algorithm>
 #include <chrono>
@@ -301,214 +301,124 @@ struct FrameInputs {
     uint32_t image_w;
 };
 
-// Returns the kernel-only elapsed time (EnqueueWriteBuffer start ->
-// EnqueueReadBuffer end) in milliseconds.
-static double process_frame(DeviceContext& ctx, const FrameInputs& f) {
-    const uint32_t image_h = f.image_h;
-    const uint32_t image_w = f.image_w;
-    const uint32_t tiles_x = (image_w + 31) / 32;
-    const uint32_t tiles_y = (image_h + 31) / 32;
-    const uint32_t num_tiles = tiles_x * tiles_y;
+// Result of LPT load balancing for one frame.
+struct TileAssignment {
+    // Concatenated per-core tile ID slices, padded up to a multiple of
+    // TILE_IDS_PAGE_BYTES so the DRAM write matches the buffer page size.
+    std::vector<uint32_t> tile_id_buffer_padded;
+    std::vector<uint32_t> per_core_offset;  // size num_cores
+    std::vector<uint32_t> per_core_count;   // size num_cores
+    size_t tile_id_buffer_bytes_padded = 0;
+};
 
-    std::vector<size_t> packs_shape, offsets_shape, px_shape, py_shape;
-    auto packs_f32 = load_npy_f32(f.packs_path, packs_shape);
-    auto offsets_f32 = load_npy_f32(f.offsets_path, offsets_shape);
-    auto px_f32 = load_npy_f32(f.px_path, px_shape);
-    auto py_f32 = load_npy_f32(f.py_path, py_shape);
+constexpr size_t TILE_IDS_PAGE_BYTES = 64;
 
-    const uint32_t total_entries = static_cast<uint32_t>(packs_shape[0]);
-
-    // Per-frame DRAM allocation. tt-metal Buffers are RAII via shared_ptr;
-    // they free on scope exit at the end of this function.
-    auto make_dram = [&](size_t bytes, size_t page_bytes) {
-        distributed::ReplicatedBufferConfig rc{.size = bytes};
-        distributed::DeviceLocalBufferConfig lc{.page_size = page_bytes, .buffer_type = BufferType::DRAM};
-        return distributed::MeshBuffer::create(rc, lc, ctx.mesh_device.get());
-    };
-
-    auto packs_dram = make_dram(static_cast<size_t>(total_entries) * SCALAR_PACK_PAGE_BYTES, SCALAR_PACK_PAGE_BYTES);
-    auto offsets_dram = make_dram(offsets_f32.size() * 4, 4);
-    auto px_dram = make_dram(static_cast<size_t>(num_tiles) * TILE_BYTES_BF16, TILE_BYTES_BF16);
-    auto py_dram = make_dram(static_cast<size_t>(num_tiles) * TILE_BYTES_BF16, TILE_BYTES_BF16);
-    auto out_dram = make_dram(static_cast<size_t>(num_tiles) * 3 * TILE_BYTES_BF16, TILE_BYTES_BF16);
-
-    // ---------------------------------------------------------------------
-    // LPT load balancing
-    // ---------------------------------------------------------------------
-    // Tiles vary wildly in Gaussian count (cost). Sort tiles descending by
-    // cost and greedily assign each to the currently least-loaded core. This
-    // is a 4/3-approximation of the optimal makespan; usually within a few
-    // percent of perfect for our workload sizes. Result is a per-core list
-    // of tile IDs that the reader/writer kernels look up at runtime.
-    const uint32_t num_cores = ctx.grid.x * ctx.grid.y;
+// LPT (Longest Processing Time first): sort tiles descending by Gaussian
+// count, then greedily assign each tile to the currently least-loaded core.
+// 4/3-approximation of the optimal makespan; usually within a few percent of
+// perfect on our workloads. Returns a per-core list of tile IDs.
+//
+// Implementation note: cores accumulate `max(cost, 1)` rather than `cost`, so
+// 0-cost (empty) tiles round-robin across cores instead of piling on the same
+// one. Without that bump, std::min_element returns the same core for every
+// empty tile (load doesn't change), and a typical scene with most tiles empty
+// would put 100+ tile IDs on one core, overflowing the reader's L1 cache.
+static std::vector<std::vector<uint32_t>> compute_lpt_assignment(
+    const std::vector<float>& offsets_f32, uint32_t num_tiles, uint32_t num_cores) {
+    std::vector<std::pair<uint32_t, uint32_t>> cost_id;
+    cost_id.reserve(num_tiles);
+    for (uint32_t t = 0; t < num_tiles; t++) {
+        const uint32_t cost = static_cast<uint32_t>(offsets_f32[t + 1] - offsets_f32[t]);
+        cost_id.emplace_back(cost, t);
+    }
+    std::sort(cost_id.begin(), cost_id.end(), std::greater<>());
 
     std::vector<std::vector<uint32_t>> per_core_tile_ids(num_cores);
-    {
-        std::vector<std::pair<uint32_t, uint32_t>> cost_id;  // (cost, tile_id)
-        cost_id.reserve(num_tiles);
-        for (uint32_t t = 0; t < num_tiles; t++) {
-            uint32_t cost = static_cast<uint32_t>(offsets_f32[t + 1] - offsets_f32[t]);
-            cost_id.emplace_back(cost, t);
-        }
-        std::sort(cost_id.begin(), cost_id.end(), std::greater<>());
-
-        std::vector<uint64_t> core_load(num_cores, 0);
-        for (const auto& [cost, id] : cost_id) {
-            auto min_it = std::min_element(core_load.begin(), core_load.end());
-            uint32_t c = static_cast<uint32_t>(std::distance(core_load.begin(), min_it));
-            per_core_tile_ids[c].push_back(id);
-            // Add at least 1 to the load so 0-cost (empty) tiles round-robin
-            // across cores instead of piling on the same one. Without this,
-            // std::min_element keeps returning the same core for every 0-cost
-            // tile (cost=0 doesn't change ordering), and a typical scene with
-            // most tiles empty would put 100+ tile IDs on one core, overflowing
-            // the reader's 64-entry L1 cache and corrupting nearby memory.
-            core_load[c] += std::max<uint64_t>(cost, 1);
-        }
+    std::vector<uint64_t> core_load(num_cores, 0);
+    for (const auto& [cost, id] : cost_id) {
+        const auto min_it = std::min_element(core_load.begin(), core_load.end());
+        const uint32_t c = static_cast<uint32_t>(std::distance(core_load.begin(), min_it));
+        per_core_tile_ids[c].push_back(id);
+        core_load[c] += std::max<uint64_t>(cost, 1);
     }
+    return per_core_tile_ids;
+}
 
-    // Concatenate per-core lists into one DRAM buffer (uint32 elements).
-    // Per-core (start, count) gives each core's slice.
-    std::vector<uint32_t> tile_id_buffer;
-    std::vector<uint32_t> per_core_offset(num_cores, 0);
-    std::vector<uint32_t> per_core_count(num_cores, 0);
-    tile_id_buffer.reserve(num_tiles);
+// Concatenate per-core tile-ID lists into one buffer with per-core (offset,
+// count) bookkeeping, padded so DRAM write covers a whole multiple of pages.
+// (tt-metal asserts size % page_size == 0; std::max alone only guarantees
+// >= one page, not multiple-of-page.)
+static TileAssignment build_tile_assignment(
+    const std::vector<float>& offsets_f32, uint32_t num_tiles, uint32_t num_cores) {
+    auto per_core = compute_lpt_assignment(offsets_f32, num_tiles, num_cores);
+
+    TileAssignment a;
+    a.per_core_offset.assign(num_cores, 0);
+    a.per_core_count.assign(num_cores, 0);
+
+    std::vector<uint32_t> flat;
+    flat.reserve(num_tiles);
     for (uint32_t c = 0; c < num_cores; c++) {
-        per_core_offset[c] = static_cast<uint32_t>(tile_id_buffer.size());
-        per_core_count[c]  = static_cast<uint32_t>(per_core_tile_ids[c].size());
-        tile_id_buffer.insert(
-            tile_id_buffer.end(),
-            per_core_tile_ids[c].begin(),
-            per_core_tile_ids[c].end());
+        a.per_core_offset[c] = static_cast<uint32_t>(flat.size());
+        a.per_core_count[c]  = static_cast<uint32_t>(per_core[c].size());
+        flat.insert(flat.end(), per_core[c].begin(), per_core[c].end());
     }
 
-    // Allocate a DRAM buffer for the tile-ID list. Page size 64B is a safe
-    // minimum for NoC alignment (matches our other small buffers). When
-    // num_tiles==0 we still allocate a 64B placeholder so the
-    // TensorAccessor config has a valid base address.
-    constexpr size_t TILE_IDS_PAGE_BYTES = 64;
-    const size_t tile_ids_bytes_payload = tile_id_buffer.size() * sizeof(uint32_t);
-    // Round up to a whole multiple of TILE_IDS_PAGE_BYTES — tt-metal asserts
-    // (size % page_size == 0). std::max alone only guarantees >= one page, not
-    // multiple-of-page; that bug only worked when num_tiles happened to be a
-    // multiple of 16 (e.g. 400 in the 640x640 integration test).
-    const size_t tile_ids_bytes_min = std::max<size_t>(tile_ids_bytes_payload, TILE_IDS_PAGE_BYTES);
-    const size_t tile_ids_bytes =
-        ((tile_ids_bytes_min + TILE_IDS_PAGE_BYTES - 1) / TILE_IDS_PAGE_BYTES) * TILE_IDS_PAGE_BYTES;
-    auto tile_ids_dram = make_dram(tile_ids_bytes, TILE_IDS_PAGE_BYTES);
-    // Pad upload to a whole page so DRAM write covers the allocated size.
-    std::vector<uint32_t> tile_id_buffer_padded(tile_ids_bytes / sizeof(uint32_t), 0);
-    std::copy(tile_id_buffer.begin(), tile_id_buffer.end(), tile_id_buffer_padded.begin());
+    const size_t bytes_payload = flat.size() * sizeof(uint32_t);
+    const size_t bytes_min = std::max<size_t>(bytes_payload, TILE_IDS_PAGE_BYTES);
+    a.tile_id_buffer_bytes_padded =
+        ((bytes_min + TILE_IDS_PAGE_BYTES - 1) / TILE_IDS_PAGE_BYTES) * TILE_IDS_PAGE_BYTES;
+    a.tile_id_buffer_padded.assign(a.tile_id_buffer_bytes_padded / sizeof(uint32_t), 0);
+    std::copy(flat.begin(), flat.end(), a.tile_id_buffer_padded.begin());
+    return a;
+}
 
-    // Encode attribute packs into 64-byte pages (9 fp32 -> 36 bytes, 28 bytes zero-padded).
-    std::vector<uint32_t> packs_payload((static_cast<size_t>(total_entries) * SCALAR_PACK_PAGE_BYTES) / 4, 0);
+// Pack N x 9 fp32 attribute rows into 64-byte pages
+// (9 fp32 = 36 bytes payload, 28 bytes zero-padded per row).
+static std::vector<uint32_t> encode_attribute_packs(
+    const std::vector<float>& packs_f32, uint32_t total_entries) {
+    std::vector<uint32_t> packs_payload(
+        (static_cast<size_t>(total_entries) * SCALAR_PACK_PAGE_BYTES) / 4, 0);
+    constexpr size_t row_payload_bytes = 9 * sizeof(float);
     for (uint32_t e = 0; e < total_entries; e++) {
         std::memcpy(
-            reinterpret_cast<uint8_t*>(packs_payload.data()) + static_cast<size_t>(e) * SCALAR_PACK_PAGE_BYTES,
+            reinterpret_cast<uint8_t*>(packs_payload.data())
+                + static_cast<size_t>(e) * SCALAR_PACK_PAGE_BYTES,
             &packs_f32[e * 9],
-            9 * 4);
+            row_payload_bytes);
     }
+    return packs_payload;
+}
 
-    // Encode px/py as bf16 tiles.
-    std::vector<uint16_t> px_bf16(static_cast<size_t>(num_tiles) * TILE_H * TILE_W);
-    std::vector<uint16_t> py_bf16(static_cast<size_t>(num_tiles) * TILE_H * TILE_W);
+// Encode (num_tiles, 32, 32) fp32 input as bf16 tile-major bytes.
+static std::vector<uint16_t> encode_tiles_to_bf16(
+    const std::vector<float>& f32, uint32_t num_tiles) {
+    std::vector<uint16_t> bf16(static_cast<size_t>(num_tiles) * TILE_H * TILE_W);
     for (uint32_t t = 0; t < num_tiles; t++) {
-        auto px_tile = fp32_tile_to_bf16(&px_f32[t * TILE_H * TILE_W]);
-        auto py_tile = fp32_tile_to_bf16(&py_f32[t * TILE_H * TILE_W]);
-        std::memcpy(&px_bf16[t * TILE_H * TILE_W], px_tile.data(), TILE_BYTES_BF16);
-        std::memcpy(&py_bf16[t * TILE_H * TILE_W], py_tile.data(), TILE_BYTES_BF16);
+        auto tile = fp32_tile_to_bf16(&f32[t * TILE_H * TILE_W]);
+        std::memcpy(&bf16[t * TILE_H * TILE_W], tile.data(), TILE_BYTES_BF16);
     }
+    return bf16;
+}
 
-    std::vector<uint32_t> offsets_u32(offsets_f32.size());
-    for (size_t i = 0; i < offsets_f32.size(); i++) {
-        offsets_u32[i] = static_cast<uint32_t>(offsets_f32[i]);
-    }
-
-    // Pull the program back out of the workload so we can refresh its runtime args.
-    auto& programs = ctx.workload.get_programs();
-    auto it = programs.find(distributed::MeshCoordinateRange(ctx.mesh_device->shape()));
-    if (it == programs.end()) {
-        throw std::runtime_error("workload missing program for device range");
-    }
-    Program& program = it->second;
-
-    // LPT-balanced per-core work distribution. Each core processes its own
-    // list of tile IDs (potentially non-contiguous) drawn from a slice of
-    // the concatenated tile_id_buffer in DRAM.
-
-    const uint32_t packs_addr    = static_cast<uint32_t>(packs_dram->address());
-    const uint32_t offsets_addr  = static_cast<uint32_t>(offsets_dram->address());
-    const uint32_t px_addr       = static_cast<uint32_t>(px_dram->address());
-    const uint32_t py_addr       = static_cast<uint32_t>(py_dram->address());
-    const uint32_t out_addr      = static_cast<uint32_t>(out_dram->address());
-    const uint32_t tile_ids_addr = static_cast<uint32_t>(tile_ids_dram->address());
-
-    uint32_t core_index = 0;
-    for (const auto& range : ctx.all_cores.ranges()) {
-        for (auto x = range.start_coord.x; x <= range.end_coord.x; x++) {
-            for (auto y = range.start_coord.y; y <= range.end_coord.y; y++) {
-                CoreCoord core{x, y};
-                const uint32_t start = per_core_offset[core_index];
-                const uint32_t count = per_core_count[core_index];
-
-                SetRuntimeArgs(
-                    program,
-                    ctx.reader,
-                    core,
-                    {
-                        packs_addr,
-                        offsets_addr,
-                        px_addr,
-                        py_addr,
-                        tile_ids_addr,
-                        /*tile_ids_start=*/start,
-                        /*tile_ids_count=*/count,
-                    });
-                SetRuntimeArgs(program, ctx.compute, core, {count});
-                SetRuntimeArgs(
-                    program,
-                    ctx.writer,
-                    core,
-                    {
-                        out_addr,
-                        tile_ids_addr,
-                        /*tile_ids_start=*/start,
-                        /*tile_ids_count=*/count,
-                    });
-                core_index++;
-            }
-        }
-    }
-
-    // ---- KERNEL TIMING: EnqueueWriteBuffer start -> EnqueueReadBuffer end ----
-    auto t_start = std::chrono::steady_clock::now();
-
-    distributed::EnqueueWriteMeshBuffer(*ctx.cq, packs_dram, packs_payload);
-    distributed::EnqueueWriteMeshBuffer(*ctx.cq, offsets_dram, offsets_u32);
-    distributed::EnqueueWriteMeshBuffer(*ctx.cq, px_dram, px_bf16);
-    distributed::EnqueueWriteMeshBuffer(*ctx.cq, py_dram, py_bf16);
-    distributed::EnqueueWriteMeshBuffer(*ctx.cq, tile_ids_dram, tile_id_buffer_padded);
-
-    distributed::EnqueueMeshWorkload(*ctx.cq, ctx.workload, /*blocking=*/false);
-
-    std::vector<uint16_t> result_bf16(static_cast<size_t>(num_tiles) * 3 * TILE_H * TILE_W);
-    distributed::EnqueueReadMeshBuffer(*ctx.cq, result_bf16, out_dram, /*blocking=*/true);
-
-    auto t_end = std::chrono::steady_clock::now();
-    double ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-    // -------------------------------------------------------------------------
-
-    // Convert bf16 tiles -> row-major fp32 (H, W, 3).
+// Convert tile-major (num_tiles, 3, 32, 32) bf16 result into a row-major
+// (image_h, image_w, 3) fp32 image, cropping to the requested image dims.
+static std::vector<float> tiles_to_image(
+    const std::vector<uint16_t>& result_bf16,
+    uint32_t num_tiles,
+    uint32_t tiles_x,
+    uint32_t image_h,
+    uint32_t image_w) {
     std::vector<float> img(static_cast<size_t>(image_h) * image_w * 3, 0.0f);
     for (uint32_t t = 0; t < num_tiles; t++) {
-        uint32_t ty = t / tiles_x;
-        uint32_t tx = t % tiles_x;
+        const uint32_t ty = t / tiles_x;
+        const uint32_t tx = t % tiles_x;
         for (uint32_t ch = 0; ch < 3; ch++) {
-            auto fp = bf16_tile_to_fp32(&result_bf16[(3 * t + ch) * TILE_H * TILE_W]);
+            const auto fp = bf16_tile_to_fp32(&result_bf16[(3 * t + ch) * TILE_H * TILE_W]);
             for (uint32_t i = 0; i < TILE_H; i++) {
                 for (uint32_t j = 0; j < TILE_W; j++) {
-                    uint32_t y = ty * TILE_H + i;
-                    uint32_t x = tx * TILE_W + j;
+                    const uint32_t y = ty * TILE_H + i;
+                    const uint32_t x = tx * TILE_W + j;
                     if (y < image_h && x < image_w) {
                         img[(static_cast<size_t>(y) * image_w + x) * 3 + ch] = fp[i * TILE_W + j];
                     }
@@ -516,9 +426,149 @@ static double process_frame(DeviceContext& ctx, const FrameInputs& f) {
             }
         }
     }
+    return img;
+}
 
+struct FrameDramBuffers {
+    std::shared_ptr<distributed::MeshBuffer> packs;
+    std::shared_ptr<distributed::MeshBuffer> offsets;
+    std::shared_ptr<distributed::MeshBuffer> px;
+    std::shared_ptr<distributed::MeshBuffer> py;
+    std::shared_ptr<distributed::MeshBuffer> output;
+    std::shared_ptr<distributed::MeshBuffer> tile_ids;
+};
+
+// Allocate the 6 DRAM buffers a frame needs. Sizes are derived from the
+// scene's total_entries + tile count + the LPT-balanced tile-id list.
+// All buffers are RAII via shared_ptr; they free on scope exit.
+static FrameDramBuffers allocate_frame_buffers(
+    DeviceContext& ctx,
+    uint32_t total_entries,
+    uint32_t num_tiles,
+    size_t offsets_count,
+    size_t tile_ids_bytes) {
+    auto make_dram = [&](size_t bytes, size_t page_bytes) {
+        distributed::ReplicatedBufferConfig rc{.size = bytes};
+        distributed::DeviceLocalBufferConfig lc{
+            .page_size = page_bytes, .buffer_type = BufferType::DRAM};
+        return distributed::MeshBuffer::create(rc, lc, ctx.mesh_device.get());
+    };
+    FrameDramBuffers b;
+    b.packs    = make_dram(static_cast<size_t>(total_entries) * SCALAR_PACK_PAGE_BYTES, SCALAR_PACK_PAGE_BYTES);
+    b.offsets  = make_dram(offsets_count * sizeof(uint32_t), sizeof(uint32_t));
+    b.px       = make_dram(static_cast<size_t>(num_tiles) * TILE_BYTES_BF16, TILE_BYTES_BF16);
+    b.py       = make_dram(static_cast<size_t>(num_tiles) * TILE_BYTES_BF16, TILE_BYTES_BF16);
+    b.output   = make_dram(static_cast<size_t>(num_tiles) * 3 * TILE_BYTES_BF16, TILE_BYTES_BF16);
+    b.tile_ids = make_dram(tile_ids_bytes, TILE_IDS_PAGE_BYTES);
+    return b;
+}
+
+// Set per-core runtime args for reader/compute/writer. Each core's slice of
+// the concatenated tile_id_buffer is identified by (per_core_offset[c],
+// per_core_count[c]); reader/writer kernels look up their tile IDs at runtime
+// via this slice.
+static void set_per_core_runtime_args(
+    Program& program,
+    const DeviceContext& ctx,
+    const FrameDramBuffers& bufs,
+    const TileAssignment& assign) {
+    const uint32_t packs_addr    = static_cast<uint32_t>(bufs.packs->address());
+    const uint32_t offsets_addr  = static_cast<uint32_t>(bufs.offsets->address());
+    const uint32_t px_addr       = static_cast<uint32_t>(bufs.px->address());
+    const uint32_t py_addr       = static_cast<uint32_t>(bufs.py->address());
+    const uint32_t out_addr      = static_cast<uint32_t>(bufs.output->address());
+    const uint32_t tile_ids_addr = static_cast<uint32_t>(bufs.tile_ids->address());
+
+    uint32_t core_index = 0;
+    for (const auto& range : ctx.all_cores.ranges()) {
+        for (auto x = range.start_coord.x; x <= range.end_coord.x; x++) {
+            for (auto y = range.start_coord.y; y <= range.end_coord.y; y++) {
+                CoreCoord core{x, y};
+                const uint32_t start = assign.per_core_offset[core_index];
+                const uint32_t count = assign.per_core_count[core_index];
+                SetRuntimeArgs(program, ctx.reader, core, {
+                    packs_addr, offsets_addr, px_addr, py_addr,
+                    tile_ids_addr, start, count,
+                });
+                SetRuntimeArgs(program, ctx.compute, core, {count});
+                SetRuntimeArgs(program, ctx.writer, core, {
+                    out_addr, tile_ids_addr, start, count,
+                });
+                core_index++;
+            }
+        }
+    }
+}
+
+// Pull the program out of the workload (it was moved in at init time) so we
+// can refresh its runtime args before each frame.
+static Program& get_program_for_workload(DeviceContext& ctx) {
+    auto& programs = ctx.workload.get_programs();
+    auto it = programs.find(distributed::MeshCoordinateRange(ctx.mesh_device->shape()));
+    if (it == programs.end()) {
+        throw std::runtime_error("workload missing program for device range");
+    }
+    return it->second;
+}
+
+// Returns the kernel-only elapsed time (EnqueueWriteBuffer start ->
+// EnqueueReadBuffer end) in milliseconds.
+static double process_frame(DeviceContext& ctx, const FrameInputs& f) {
+    const uint32_t image_h = f.image_h;
+    const uint32_t image_w = f.image_w;
+    const uint32_t tiles_x = (image_w + TILE_W - 1) / TILE_W;
+    const uint32_t tiles_y = (image_h + TILE_H - 1) / TILE_H;
+    const uint32_t num_tiles = tiles_x * tiles_y;
+    const uint32_t num_cores = ctx.grid.x * ctx.grid.y;
+
+    // 1. Load .npy fixtures.
+    std::vector<size_t> packs_shape, offsets_shape, px_shape, py_shape;
+    auto packs_f32   = load_npy_f32(f.packs_path,   packs_shape);
+    auto offsets_f32 = load_npy_f32(f.offsets_path, offsets_shape);
+    auto px_f32      = load_npy_f32(f.px_path,      px_shape);
+    auto py_f32      = load_npy_f32(f.py_path,      py_shape);
+    const uint32_t total_entries = static_cast<uint32_t>(packs_shape[0]);
+
+    // 2. LPT-balanced tile-to-core assignment.
+    const TileAssignment assign = build_tile_assignment(offsets_f32, num_tiles, num_cores);
+
+    // 3. Allocate per-frame DRAM buffers and prepare upload payloads.
+    // (Non-const because EnqueueWrite/ReadMeshBuffer takes non-const lvalue
+    // refs to shared_ptr<MeshBuffer>.)
+    FrameDramBuffers bufs = allocate_frame_buffers(
+        ctx, total_entries, num_tiles, offsets_f32.size(),
+        assign.tile_id_buffer_bytes_padded);
+    auto packs_payload = encode_attribute_packs(packs_f32, total_entries);
+    auto px_bf16 = encode_tiles_to_bf16(px_f32, num_tiles);
+    auto py_bf16 = encode_tiles_to_bf16(py_f32, num_tiles);
+    std::vector<uint32_t> offsets_u32(offsets_f32.size());
+    for (size_t i = 0; i < offsets_f32.size(); i++) {
+        offsets_u32[i] = static_cast<uint32_t>(offsets_f32[i]);
+    }
+
+    // 4. Refresh runtime args for this frame.
+    Program& program = get_program_for_workload(ctx);
+    set_per_core_runtime_args(program, ctx, bufs, assign);
+
+    // 5. Kernel timing window: DRAM upload start -> output readback end.
+    const auto t_start = std::chrono::steady_clock::now();
+    distributed::EnqueueWriteMeshBuffer(*ctx.cq, bufs.packs,    packs_payload);
+    distributed::EnqueueWriteMeshBuffer(*ctx.cq, bufs.offsets,  offsets_u32);
+    distributed::EnqueueWriteMeshBuffer(*ctx.cq, bufs.px,       px_bf16);
+    distributed::EnqueueWriteMeshBuffer(*ctx.cq, bufs.py,       py_bf16);
+    distributed::EnqueueWriteMeshBuffer(*ctx.cq, bufs.tile_ids, assign.tile_id_buffer_padded);
+    distributed::EnqueueMeshWorkload(*ctx.cq, ctx.workload, /*blocking=*/false);
+    std::vector<uint16_t> result_bf16(
+        static_cast<size_t>(num_tiles) * 3 * TILE_H * TILE_W);
+    distributed::EnqueueReadMeshBuffer(*ctx.cq, result_bf16, bufs.output, /*blocking=*/true);
+    const auto t_end = std::chrono::steady_clock::now();
+    const double kernel_ms =
+        std::chrono::duration<double, std::milli>(t_end - t_start).count();
+
+    // 6. Tile-major bf16 output -> row-major fp32 image; save .npy.
+    const auto img = tiles_to_image(result_bf16, num_tiles, tiles_x, image_h, image_w);
     save_npy_f32(f.out_path, img, {image_h, image_w, 3});
-    return ms;
+    return kernel_ms;
 }
 
 // ---------------------------------------------------------------------------

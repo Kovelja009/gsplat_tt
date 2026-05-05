@@ -15,13 +15,36 @@ def main():
     parser.add_argument(
         "--host", type=str, default="0.0.0.0", help="Viewer host (default: 0.0.0.0)"
     )
+    parser.add_argument(
+        "--backend",
+        choices=["cpu", "kernel"],
+        default="cpu",
+        help="Rendering backend (default: cpu)",
+    )
+    parser.add_argument(
+        "--max-resolution",
+        type=int,
+        default=640,
+        help=(
+            "Cap longest dim of the render (preserving aspect ratio, rounded "
+            "down to multiple of 32). Prevents the kernel backend from "
+            "spending seconds in prepare_kernel_inputs at typical browser "
+            "resolutions. Default: 640."
+        ),
+    )
     args = parser.parse_args()
 
     print(f"Loading Gaussians from {args.ply_path}...")
     gaussians = load_ply(args.ply_path)
     print(f"Loaded {gaussians.num_gaussians:,} Gaussians")
 
-    viewer = GaussianViewer(gaussians, host=args.host, port=args.port)
+    viewer = GaussianViewer(
+        gaussians,
+        host=args.host,
+        port=args.port,
+        backend=args.backend,
+        max_resolution=args.max_resolution,
+    )
     viewer.run()
 
 

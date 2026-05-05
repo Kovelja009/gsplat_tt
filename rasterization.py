@@ -116,7 +116,7 @@ def get_tile_assignments(
     radii: torch.Tensor,
     image_height: int,
     image_width: int,
-    tile_size: int = 16,
+    tile_size: int = 32,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Assign each visible Gaussian to the screen tiles it overlaps.
 
@@ -130,7 +130,7 @@ def get_tile_assignments(
         radii: (M,) bounding circle radius in pixels (at 3σ).
         image_height: output image height in pixels.
         image_width: output image width in pixels.
-        tile_size: tile dimension in pixels (default 16x16).
+        tile_size: tile dimension in pixels (default 32x32, matches the kernel).
 
     Returns:
         gaussian_ids: (P,) index into means_2d for each Gaussian-tile pair.
@@ -260,7 +260,7 @@ def alpha_blend(
     tile_ranges: torch.Tensor,
     image_height: int,
     image_width: int,
-    tile_size: int = 16,
+    tile_size: int = 32,
 ) -> torch.Tensor:
     """Render the final image by compositing Gaussians front-to-back per pixel.
 
@@ -286,7 +286,7 @@ def alpha_blend(
         tile_ranges: (num_tiles, 2) start/end indices per tile in sorted array.
         image_height: output image height in pixels.
         image_width: output image width in pixels.
-        tile_size: tile dimension in pixels (default 16x16).
+        tile_size: tile dimension in pixels (default 32x32, matches the kernel).
 
     Returns:
         image: (image_height, image_width, 3) rendered RGB image.

@@ -357,7 +357,13 @@ static double process_frame(DeviceContext& ctx, const FrameInputs& f) {
             auto min_it = std::min_element(core_load.begin(), core_load.end());
             uint32_t c = static_cast<uint32_t>(std::distance(core_load.begin(), min_it));
             per_core_tile_ids[c].push_back(id);
-            core_load[c] += cost;
+            // Add at least 1 to the load so 0-cost (empty) tiles round-robin
+            // across cores instead of piling on the same one. Without this,
+            // std::min_element keeps returning the same core for every 0-cost
+            // tile (cost=0 doesn't change ordering), and a typical scene with
+            // most tiles empty would put 100+ tile IDs on one core, overflowing
+            // the reader's 64-entry L1 cache and corrupting nearby memory.
+            core_load[c] += std::max<uint64_t>(cost, 1);
         }
     }
 
@@ -382,7 +388,13 @@ static double process_frame(DeviceContext& ctx, const FrameInputs& f) {
     // TensorAccessor config has a valid base address.
     constexpr size_t TILE_IDS_PAGE_BYTES = 64;
     const size_t tile_ids_bytes_payload = tile_id_buffer.size() * sizeof(uint32_t);
-    const size_t tile_ids_bytes = std::max<size_t>(tile_ids_bytes_payload, TILE_IDS_PAGE_BYTES);
+    // Round up to a whole multiple of TILE_IDS_PAGE_BYTES — tt-metal asserts
+    // (size % page_size == 0). std::max alone only guarantees >= one page, not
+    // multiple-of-page; that bug only worked when num_tiles happened to be a
+    // multiple of 16 (e.g. 400 in the 640x640 integration test).
+    const size_t tile_ids_bytes_min = std::max<size_t>(tile_ids_bytes_payload, TILE_IDS_PAGE_BYTES);
+    const size_t tile_ids_bytes =
+        ((tile_ids_bytes_min + TILE_IDS_PAGE_BYTES - 1) / TILE_IDS_PAGE_BYTES) * TILE_IDS_PAGE_BYTES;
     auto tile_ids_dram = make_dram(tile_ids_bytes, TILE_IDS_PAGE_BYTES);
     // Pad upload to a whole page so DRAM write covers the allocated size.
     std::vector<uint32_t> tile_id_buffer_padded(tile_ids_bytes / sizeof(uint32_t), 0);

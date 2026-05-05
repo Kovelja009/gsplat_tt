@@ -179,6 +179,7 @@ class GaussianViewer:
         t_proj = time.perf_counter()
         means_2d, covs_2d, depths, radii, valid_mask = project_gaussians(
             g.means, g.scales, g.rotations, extrinsics, intrinsics, H, W,
+            opacities=g.opacities,
         )
         proj_ms = (time.perf_counter() - t_proj) * 1000.0
 

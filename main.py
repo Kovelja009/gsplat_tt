@@ -24,12 +24,12 @@ def main():
     parser.add_argument(
         "--max-resolution",
         type=int,
-        default=1280,
+        default=640,
         help=(
             "Cap longest dim of the render (preserving aspect ratio, rounded "
             "down to multiple of 32). Prevents the kernel backend from "
             "spending seconds in prepare_kernel_inputs at typical browser "
-            "resolutions. Default: 1280."
+            "resolutions. Default: 640."
         ),
     )
     parser.add_argument(

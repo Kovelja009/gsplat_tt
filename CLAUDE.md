@@ -90,20 +90,32 @@ psnr = compute_psnr(image_cpu, image_tt)
 - **For anything touching `ttnn` or tt-metal (building kernels, running the C++ harness, Python scripts that import `ttnn`)**: activate the tt-metal venv instead — `source tt-metal/python_env/bin/activate`. That venv is created by `tt-metal/create_venv.sh` during the initial tt-metal build and lives at `tt-metal/python_env/` (note: `python_env`, not `venv`).
 - Don't mix the two venvs in one shell — `deactivate` before switching.
 
-## tt-metal vendoring
+## Project setup
 
-The `tt-metal/` directory is a vendored clone of `tenstorrent/tt-metal`. It's mostly git-ignored; only `tt-metal/tt_metal/programming_examples/gaussian_splatting/` is tracked (via `.gitignore` exceptions).
+**Default path: just run `./setup.sh` from the repo root.** It is idempotent
+(safe to re-run) and handles all six bootstrap steps:
 
-**One-time setup after re-vendoring tt-metal**:
-1. Remove the embedded `.git/` so the parent repo can track files inside:
-   ```bash
-   rm -rf tt-metal/.git
-   ```
-2. Register our kernel subdir in tt-metal's CMake (edit the vendored file, will NOT be tracked):
-   ```cmake
-   # tt-metal/tt_metal/programming_examples/CMakeLists.txt
-   add_subdirectory(gaussian_splatting)
-   ```
-3. Build tt-metal: `cd tt-metal && source python_env/bin/activate && sudo ./build_metal.sh`
+1. Creates `./venv` (the project venv) and installs `requirements.txt`.
+2. Clones `tenstorrent/tt-metal` into `./tt-metal` (~5 GB).
+3. Removes the embedded `tt-metal/.git` so the parent repo can track our
+   kernel subdir (the rest of tt-metal stays untracked via `.gitignore`).
+4. Adds `add_subdirectory(gaussian_splatting)` to
+   `tt-metal/tt_metal/programming_examples/CMakeLists.txt` so the tt-metal
+   build picks up our kernel.
+5. Sets up `./tt-metal/python_env` via `tt-metal/create_venv.sh`.
+6. Runs `sudo ./build_metal.sh` to build the host binary.
 
-**Note**: building requires `sudo` on this system because `tt-metal/runtime/sfpi/` and `tt-metal/.cpmcache/` are root-owned from the initial dependency install. Always prefix `./build_metal.sh` with `sudo`.
+Override the tt-metal version by setting `TT_METAL_REF` (default `main`):
+```bash
+TT_METAL_REF=v1.2.3 ./setup.sh
+```
+
+If you (or Claude) ever need to do this manually — e.g. to re-vendor a
+different tt-metal version without re-running the whole script — those six
+steps above are the canonical procedure. Step 6 (`sudo ./build_metal.sh`)
+is required because `tt-metal/runtime/sfpi/` and `tt-metal/.cpmcache/` are
+root-owned from the initial dependency install.
+
+The `tt-metal/` directory is mostly git-ignored; only
+`tt-metal/tt_metal/programming_examples/gaussian_splatting/` is tracked
+(via narrow `.gitignore` allow-list exceptions).

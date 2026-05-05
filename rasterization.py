@@ -12,6 +12,8 @@ def project_gaussians(
     intrinsics: torch.Tensor,
     image_height: int,
     image_width: int,
+    opacities: torch.Tensor | None = None,
+    min_opacity: float = 1.0 / 255.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Project 3D Gaussians to 2D screen-space ellipses.
 
@@ -31,6 +33,11 @@ def project_gaussians(
         intrinsics: (3, 3) camera intrinsic matrix.
         image_height: output image height in pixels.
         image_width: output image width in pixels.
+        opacities: optional (N,) per-Gaussian opacity. If provided, Gaussians
+            with opacity < min_opacity are culled — their peak pixel
+            contribution would be below 8-bit quantization anyway.
+        min_opacity: opacity threshold (default 1/255 = 0.0039). Only used
+            when `opacities` is provided.
 
     Returns:
         means_2d: (M, 2) screen-space positions of visible Gaussians.
@@ -105,6 +112,27 @@ def project_gaussians(
     valid_mask = valid_mask & (means_2d[:, 1] + radii > 0)
     valid_mask = valid_mask & (means_2d[:, 1] - radii < image_height)
     valid_mask = valid_mask & (radii > 0)
+
+    # Cap the bounding radius. The Jacobian linearization of the perspective
+    # transform (Step 5 above) breaks down when a Gaussian's 3D extent is
+    # comparable to its distance from the camera — producing wildly wrong 2D
+    # covariances and massive bounding circles. Visually these show up as
+    # giant fuzzy blobs right in front of the camera when zooming in.
+    # Capping `radii` to half the smaller image dim drops these projection-
+    # breakdown cases without affecting legitimate close-up content (a
+    # Gaussian that genuinely covers more than half the viewport is almost
+    # always an artifact, not real geometry).
+    max_radius = min(image_height, image_width) // 2
+    valid_mask = valid_mask & (radii <= max_radius)
+
+    # Optional opacity cull: a Gaussian's peak per-pixel contribution is
+    # `opacity * exp(0) = opacity` (at its center). If that's below the 8-bit
+    # quantization step (1/255), the Gaussian is invisible everywhere and can
+    # be dropped — significant kernel speedup on translucent-heavy scenes
+    # like Mip-NeRF 360 captures (median opacity ~0.16). Synthetic / luigi
+    # scenes are typically opaque, so this filter is a no-op for them.
+    if opacities is not None:
+        valid_mask = valid_mask & (opacities >= min_opacity)
 
     depths = means_cam[valid_mask, 2]
 

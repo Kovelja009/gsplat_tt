@@ -6,35 +6,41 @@
 
 #include "api/dataflow/dataflow_api.h"
 
-// T2.3 / T4.2 alpha-blend writer: drains 3 tiles per screen tile from
-// cb_color_out (R, G, B in that order) and async-writes them to consecutive
-// DRAM tile slots {3*tile_id + 0, 3*tile_id + 1, 3*tile_id + 2}.
+// Alpha-blend WRITER kernel (NCRISC, NoC1).
 //
-// T4.2 LPT load balancing: this core processes a list of (potentially
-// non-contiguous) tile IDs read from a small per-core slice of a
-// concatenated tile-ID DRAM buffer. The slice is loaded into L1 once at
-// startup; the per-tile loop indexes by element rather than computing
-// `first_tile_id + t`.
+// ROLE
+// ----
+// The mirror of the reader on the output side. For each screen tile this
+// core processed, the compute kernel pushes 3 bf16 32x32 tiles (R, G, B in
+// that order) to CB_COLOR_OUT. We async-write them to consecutive DRAM
+// pages at offsets `3*screen_tile + {0, 1, 2}` of the output buffer. The
+// writer uses NoC1 while the reader uses NoC0 — bidirectional dual-NoC
+// torus lets I/O overlap.
 //
-// Per screen tile id (drawn from the per-core tile-ID list):
-//   1. wait for 3 tiles in cb_color_out (compute pushes R, G, B)
-//   2. async-write tile 0 (R) -> DRAM page 3*screen_tile + 0
-//      async-write tile 1 (G) -> DRAM page 3*screen_tile + 1
-//      async-write tile 2 (B) -> DRAM page 3*screen_tile + 2
-//   3. barrier + pop 3 tiles
+// LPT TILE ASSIGNMENT
+// -------------------
+// Same shape as the reader: the host writes a per-core slice of (possibly
+// non-contiguous) tile IDs into a shared DRAM buffer; we cache our slice
+// in an L1 stack array at startup and index by element. Sizing is the same
+// (MAX_TILE_IDS_PER_CORE = 256, supporting up to 4K renders).
 //
-// Runtime args layout:
-//   0: out_addr        (DRAM base of the rgb output buffer; one 32x32 bf16
-//                       tile per channel, interleaved as R,G,B,R,G,B,...)
-//   1: tile_ids_addr   (DRAM base of concatenated per-core tile-ID list,
-//                       uint32 elems, page size 64B)
-//   2: tile_ids_start  (uint32 element offset of this core's slice)
-//   3: tile_ids_count  (number of tile IDs this core handles)
+// PER-TILE WORK
+// -------------
+//   1. cb_wait_front(CB_COLOR_OUT, 3)   wait for compute's R/G/B push
+//   2. async-write 3 channels to DRAM pages 3*screen_tile + {0, 1, 2}
+//   3. cb_pop_front(CB_COLOR_OUT, 3)
 //
-// Compile-time args: 2 TensorAccessorArgs in order
-//   out, tile_ids.
+// RUNTIME ARGS
+//   0: out_addr           DRAM base of the (num_tiles, 3, 32, 32) bf16 output buffer
+//   1: tile_ids_addr      DRAM base of concatenated tile-id list
+//   2: tile_ids_start     this core's element offset into that list
+//   3: tile_ids_count     number of tile IDs this core handles
+//
+// COMPILE-TIME ARGS: 2 TensorAccessorArgs in order: out, tile_ids.
 
-constexpr uint32_t MAX_TILE_IDS_PER_CORE = 64;
+// Match the reader's cap (sized for 4K renders); see reader_alpha_blend.cpp
+// for the reasoning.
+constexpr uint32_t MAX_TILE_IDS_PER_CORE = 256;
 
 void kernel_main() {
     uint32_t out_addr        = get_arg_val<uint32_t>(0);
@@ -86,12 +92,21 @@ void kernel_main() {
         }
     }
 
+    // Main per-tile loop: drain 3 R/G/B tiles compute pushed for this screen
+    // tile and async-write them to their global slots in the output buffer.
     for (uint32_t t = 0; t < tile_ids_count; t++) {
         uint32_t screen_tile = tile_ids[t];
 
+        // Wait for compute's batch of 3 tiles (R, then G, then B) in order.
+        // Note: CB_COLOR_OUT has depth 6 (multiple of 3) on the host side so
+        // this 3-tile batch never straddles a CB wrap, which would break the
+        // `read_ptr += tile_bytes` arithmetic below.
         cb_wait_front(CB_COLOR_OUT, 3);
         uint32_t read_ptr = get_read_ptr(CB_COLOR_OUT);
         for (uint32_t ch = 0; ch < 3; ch++) {
+            // Output buffer layout: (num_tiles, 3, 32, 32) bf16. Tile-major
+            // order with R/G/B interleaved per screen tile, so the global
+            // page index for channel `ch` of `screen_tile` is `3*screen_tile + ch`.
             uint32_t out_tile_id = 3 * screen_tile + ch;
             noc_async_write_tile(out_tile_id, out, read_ptr);
             read_ptr += tile_bytes;

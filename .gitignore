@@ -231,3 +231,12 @@ thesis_plan.md
 # claude-mem auto-context files (allow only the root project CLAUDE.md)
 **/CLAUDE.md
 !/CLAUDE.md
+
+# tt-metal runtime artifacts (DPRINT, watcher logs, profiler output)
+/generated/
+
+# Scene files: only luigi.ply (~1 MB) is small enough to track. The Mip-NeRF 360
+# captures (bonsai/train/truck/...) are 100s of MB and exceed GitHub's per-file
+# limit; users download those from the dataset directly.
+/scene/*.ply
+!/scene/luigi.ply

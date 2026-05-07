@@ -11,7 +11,7 @@ MSc thesis project — inference only, no training or backward pass.
 
 The same viewer can dispatch to multiple rasterizers:
 
-| `--backend` | Status | What |
+| `backend` | Status | What |
 |---|---|---|
 | `cpu`  | shipping | Pure PyTorch reference. Slow (~1–2 s/frame at 256×256), used as the correctness baseline. |
 | `tt`   | shipping | tt-metal kernels on a Tenstorrent Wormhole device. ~80 ms/frame at 640×640 (21.7× CPU). |

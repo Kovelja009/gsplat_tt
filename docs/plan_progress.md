@@ -303,61 +303,43 @@ If 3.4 hits ≥35 dB PSNR, T0.6 is logged as v2 cleanup.
 
 ---
 
-### KI-2 — Multi-tile dispatch deadlock above ~18 populated tiles (deferred)
+### KI-2 — Multi-tile dispatch deadlock at ≥16 active cores [RESOLVED 2026-05-07]
 
-**Status**: tracked. Workaround: keep `--max-resolution ≤ 640` for the interactive viewer.
-Synthetic-scene tests up to 400 tiles / 235K entries are unaffected.
+**Symptom**: viewer hangs intermittently when rendering scenes with sparse
+tile occupancy at ≥768 resolution on the default 8×8 (64-core) grid.
+Per-frame hang rate ~65% on the minimal repro; the daemon viewer effectively
+hangs within a few frames because P(no hang)^N → 0.
 
-**Symptom**: when running luigi.ply (14.5K Gaussians, tightly clustered) at
-`--max-resolution ≥ 768`, the second-or-later FRAME in the daemon hangs indefinitely
-(host CPU spins at ~73% in `EnqueueReadMeshBuffer`, daemon process alive but kernel
-on Wormhole never completes, no stderr output). Discovered while testing higher
-viewer resolutions on a real scene; 640 works, 768/800/896/960 all hang on the
-second different-aspect frame.
+**Root cause**: producer/consumer CB deadlock triggered by extreme empty-tile
+churn. Sparse scenes have ~95% empty tiles (tiles with zero Gaussians).
+Empty tiles still pumped the full per-tile CB pipeline (TILE_META + PX + PY
+push → compute init → R/G/B push → writer drain → state CB pop). At ≥16
+active cores the high-frequency churn deadlocked the CB protocol; watcher
+trace caught 5 of 16 cores stuck with reader on `CRBW` (cb_reserve_back),
+writer on `CWFW` (cb_wait_front).
 
-**Reproduction**: a deterministic `.npy` minimal repro is at
-`/tmp/hang_subset_first18_cap6/` — only 18 populated tiles × 6 entries each = 108
-total entries, well under the synthetic test's 235K. The captured viewer-data is at
-`/tmp/hang_repro/` (480×768, 360 tiles, 38865 entries).
+Confirmed via grid scaling sweep (N=20 each, identical sparse input):
 
-**Bisect findings**:
-- ✅ Single tile alone (any of the 27 nonzero tiles): passes
-- ✅ Drop-heaviest or only-heaviest: passes (no single tile triggers it)
-- ✅ Opacity clamp to 0.5/0.7/0.9: still hangs (NOT the T0.6 saturation bug at scale)
-- ✅ Cap to ≤ 5 entries per tile (with all 27 tiles): passes
-- ❌ ≥ 18 populated tiles AND ≥ 6 entries per tile: hangs
-- ❌ Subsample to half/quarter: still hangs
+| Grid  | Cores | Hangs/20 (before fix) |
+|-------|-------|------------------------|
+| 4×1, 8×1, 4×2 | 4–8 | 0 |
+| 4×4   |  16   |  12 (60%) |
+| 8×2   |  16   |  20 (100%) — deterministic worst-case |
+| 8×8   |  64   |  13 (65%) |
 
-So the trigger is **populated-tile count crossing ~18 with non-trivial per-tile work**,
-not data content or single-tile size. Pattern is consistent with a dispatch-level
-deadlock — NoC contention, command-queue scheduling, or a CB race that surfaces only
-when many cores are simultaneously busy with sparse-but-large per-core tile lists.
+**Fix**: filter empty tiles in `compute_lpt_assignment` so they never reach
+the kernel; pre-zero the output buffer per frame in `process_frame` so
+filtered tile slots show as black instead of stale DRAM. After fix, all
+grid sizes are 0/20 hangs.
 
-**Why synthetic tests pass**: with random-distributed Gaussians, all 400 tiles have
-roughly even entry counts. With luigi at high resolution, only 18-30 tiles are populated
-(Gaussians cluster on screen) — the LPT round-robin then puts ~7-8 tiles per core, but
-only ~18 cores have heavy work. That asymmetric load distribution is what triggers it.
+**Validation**:
+- All 3 integration tests pass (PSNR 51.65 dB, daemon perf 82 ms/frame)
+- Viewer runs luigi.ply at `--max-resolution 768` cleanly
+- Output correctness verified: empty regions are exactly 0.0
 
-**Why it doesn't gate the thesis**:
-- v1a / T0.5 / T0.7 / T3.4 / T3.5 all pass.
-- 64×64 PSNR test: 62.98 dB.
-- Daemon perf at 640×640: 80 ms / frame, 21.7× vs CPU.
-- Multi-core LPT correctness validated.
-- Workaround for the viewer (max_resolution ≤ 640) is the default.
-
-**Suspected next debug steps when revisited**:
-- Add `DPRINT` to reader/compute/writer kernels to identify which core hangs and at
-  what stage (CB wait, NoC barrier, etc.).
-- Try the failing input with multi-core split DISABLED (single core fallback) — if
-  it works, the bug is in the per-core dispatch. If it still hangs, in the per-core
-  kernel itself.
-- Try with reader's `MAX_TILE_IDS_PER_CORE` shrunk to 32 — if it changes behavior, an
-  L1-layout / stack-overlap issue.
-- Try non-LPT contiguous split — if it works, the bug is specific to non-contiguous
-  tile-id reads in the reader.
-- Inspect tt-metal's command-queue handling when a Workload's runtime args change
-  count semantics frequently (small-then-big-then-small frames).
-
+**Watcher recipe** (preserved for future debugging):
+`TT_METAL_WATCHER=1 TT_METAL_WATCHER_DISABLE_SANITIZE_NOC=1` —
+sanitizers off keeps perturbation low enough to still trigger races.
 ---
 
 ## Next Steps (after all decisions locked)

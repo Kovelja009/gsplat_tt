@@ -6,7 +6,9 @@
 
 #include "api/dataflow/dataflow_api.h"
 
-// Alpha-blend READER kernel (BRISC, NoC0).
+// Alpha-blend READER kernel (NCRISC, NoC1; see DataMovementProcessor::RISCV_1
+// in alpha_blend.cpp). The host launches reader on RISCV_1 / NoC1 and writer
+// on RISCV_0 / NoC0 so reads and writes use opposite NoCs.
 //
 // ROLE
 // ----

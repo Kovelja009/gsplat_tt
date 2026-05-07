@@ -3,46 +3,32 @@
 #
 # Idempotent. Safe to re-run; each step skips work that's already done.
 #
-# What this does:
-#   1. Creates the project venv at ./venv (if missing) and installs
-#      requirements.txt — this is the venv used for main.py / viewer.
-#   2. Clones tenstorrent/tt-metal into ./tt-metal (if missing) — large,
-#      ~5 GB. The .gitignore narrowly allow-lists our kernel subdir
-#      (tt_metal/programming_examples/gaussian_splatting/) so the parent
-#      repo can track it without picking up the rest of the SDK.
-#   3. Removes the embedded tt-metal/.git so the parent repo can see
-#      files inside the vendored clone.
-#   4. Registers our kernel subdir in tt-metal's
-#      programming_examples/CMakeLists.txt so the tt-metal build picks
-#      it up automatically.
-#   5. Sets up tt-metal's python_env (a separate venv with ttnn/tt-metal
-#      Python bindings) via tt-metal/create_venv.sh.
-#   6. Builds tt-metal (requires sudo — tt-metal's runtime/sfpi/ and
-#      .cpmcache/ are root-owned from initial dependency install).
+# Steps:
+#   1. Project venv at ./venv with requirements.txt + `pip install -e .`
+#   2. Vendor tt-metal into backends/tt/tt-metal/ (~5 GB clone)
+#   3. Drop the embedded .git so the parent repo can track our kernel subdir
+#   4. Register our kernel subdir in tt-metal's programming_examples CMake
+#   5. Set up tt-metal's python_env (separate venv with ttnn bindings)
+#   6. Build tt-metal (requires sudo for SFPI / .cpmcache)
 #
 # Usage:
 #   ./setup.sh
+#   TT_METAL_REF=v1.2.3 ./setup.sh    # pin a specific tt-metal tag
 #
-# After this completes:
-#
-#   # CPU viewer (no kernel)
+# After this finishes the kernel viewer runs as:
 #   source venv/bin/activate
-#   python main.py scene/luigi.ply
+#   export TT_METAL_HOME=$PWD/backends/tt/tt-metal
+#   export TT_METAL_RUNTIME_ROOT=$PWD/backends/tt/tt-metal
+#   gsplat scenes/luigi.ply --backend tt
 #
-#   # Tenstorrent kernel-accelerated viewer
-#   source venv/bin/activate
-#   export TT_METAL_HOME=$PWD/tt-metal
-#   export TT_METAL_RUNTIME_ROOT=$PWD/tt-metal
-#   python main.py scene/luigi.ply --backend kernel
+# (CPU viewer needs only `source venv/bin/activate && gsplat scenes/luigi.ply`.)
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
 
-# tt-metal upstream source. Pinning to a specific tag/commit is safer for
-# reproducibility (set TT_METAL_REF=v1.2.3 in the environment to override);
-# main is the default for users who just want the latest.
+TT_METAL_DIR="backends/tt/tt-metal"
 TT_METAL_REPO="https://github.com/tenstorrent/tt-metal.git"
 TT_METAL_REF="${TT_METAL_REF:-main}"
 
@@ -50,7 +36,7 @@ say()  { printf "\n\033[1;36m== %s ==\033[0m\n" "$*"; }
 warn() { printf "\033[1;33m!! %s\033[0m\n" "$*" >&2; }
 fail() { printf "\033[1;31m!! %s\033[0m\n" "$*" >&2; exit 1; }
 
-# ----- Pre-flight checks -----------------------------------------------------
+# ----- Pre-flight ------------------------------------------------------------
 command -v python3 >/dev/null 2>&1 || fail "python3 not found on PATH"
 command -v git     >/dev/null 2>&1 || fail "git not found on PATH"
 command -v sudo    >/dev/null 2>&1 || fail "sudo not found (build_metal.sh needs root for SFPI cache)"
@@ -61,79 +47,82 @@ if [ ! -d "venv" ]; then
     python3 -m venv venv
 fi
 
-say "Installing project requirements into ./venv"
+say "Installing project requirements + editable package"
 # shellcheck disable=SC1091
 source venv/bin/activate
 pip install --upgrade pip --quiet
 pip install -r requirements.txt
+pip install -e .
 deactivate
 
 # ----- 2. Vendor tt-metal ----------------------------------------------------
-if [ ! -d "tt-metal" ]; then
-    say "Cloning tenstorrent/tt-metal (~5 GB, may take several minutes)"
+mkdir -p "$(dirname "$TT_METAL_DIR")"
+if [ ! -d "$TT_METAL_DIR" ]; then
+    say "Cloning tenstorrent/tt-metal into $TT_METAL_DIR (~5 GB, may take several minutes)"
     git clone --recurse-submodules --branch "$TT_METAL_REF" \
-        "$TT_METAL_REPO" tt-metal
-elif [ ! -d "tt-metal/tt_metal" ]; then
-    fail "tt-metal/ exists but doesn't look like a tt-metal checkout. Remove or restore it before running setup."
+        "$TT_METAL_REPO" "$TT_METAL_DIR"
+elif [ ! -d "$TT_METAL_DIR/tt_metal" ]; then
+    fail "$TT_METAL_DIR exists but doesn't look like a tt-metal checkout. Remove it before re-running setup."
 else
-    say "tt-metal/ already present, skipping clone"
+    say "$TT_METAL_DIR already present, skipping clone"
 fi
 
-# Remove embedded .git so the parent repo can track files inside tt-metal/.
-# (The .gitignore allow-lists our kernel subdir specifically; the rest of
-# tt-metal stays untracked.)
-if [ -d "tt-metal/.git" ]; then
-    say "Removing embedded tt-metal/.git so parent repo can track our kernel subdir"
-    rm -rf tt-metal/.git
+# Drop embedded .git so the parent repo can track files inside the vendored
+# tree (the .gitignore allow-lists our kernel subdir; rest stays untracked).
+if [ -d "$TT_METAL_DIR/.git" ]; then
+    say "Removing embedded $TT_METAL_DIR/.git"
+    rm -rf "$TT_METAL_DIR/.git"
 fi
 
-# ----- 3. Register kernel subdir in tt-metal's CMake ------------------------
-PE_CMAKE="tt-metal/tt_metal/programming_examples/CMakeLists.txt"
+# ----- 3. Register our kernel subdir in tt-metal's CMake --------------------
+PE_CMAKE="$TT_METAL_DIR/tt_metal/programming_examples/CMakeLists.txt"
 if [ ! -f "$PE_CMAKE" ]; then
     fail "$PE_CMAKE not found — tt-metal layout has changed; update setup.sh"
 fi
-if grep -qF "add_subdirectory(gaussian_splatting)" "$PE_CMAKE"; then
-    say "gaussian_splatting subdir already registered in $PE_CMAKE"
-else
-    say "Adding 'add_subdirectory(gaussian_splatting)' to $PE_CMAKE"
+if ! grep -qF "add_subdirectory(gaussian_splatting)" "$PE_CMAKE"; then
+    say "Registering gaussian_splatting subdir in $PE_CMAKE"
     printf "\nadd_subdirectory(gaussian_splatting)\n" >> "$PE_CMAKE"
+else
+    say "gaussian_splatting subdir already registered"
 fi
 
-# ----- 4. tt-metal python_env (separate venv used by ttnn / build) ----------
-if [ -d "tt-metal/python_env" ]; then
-    say "tt-metal/python_env already present, skipping"
+# ----- 4. tt-metal python_env (ttnn bindings) -------------------------------
+if [ -d "$TT_METAL_DIR/python_env" ]; then
+    say "$TT_METAL_DIR/python_env already present, skipping"
 else
-    say "Setting up tt-metal/python_env (ttnn bindings; takes a few minutes)"
-    pushd tt-metal >/dev/null
-    if [ ! -x "./create_venv.sh" ]; then
-        fail "tt-metal/create_venv.sh not found or not executable"
-    fi
+    say "Setting up $TT_METAL_DIR/python_env (ttnn bindings; takes a few minutes)"
+    pushd "$TT_METAL_DIR" >/dev/null
+    [ -x "./create_venv.sh" ] || fail "create_venv.sh missing/not executable in $TT_METAL_DIR"
     ./create_venv.sh
     popd >/dev/null
 fi
 
-# ----- 5. Build tt-metal -----------------------------------------------------
-say "Building tt-metal (sudo required for SFPI / CPM caches)"
-warn "This step can take 10-20 minutes on a first build."
-pushd tt-metal >/dev/null
+# ----- 5. Build tt-metal + our kernel ---------------------------------------
+# `--build-programming-examples` is required so tt-metal's CMake includes
+# `programming_examples/`, which contains our gaussian_splatting subproject.
+# Without the flag, BUILD_PROGRAMMING_EXAMPLES=OFF and the
+# `metal_example_gaussian_splatting` target is never created.
+say "Building tt-metal + gaussian_splatting kernel (sudo required for SFPI / CPM caches)"
+warn "First build can take 10-20 minutes."
+pushd "$TT_METAL_DIR" >/dev/null
 # shellcheck disable=SC1091
 source python_env/bin/activate
-sudo ./build_metal.sh
+sudo ./build_metal.sh --build-programming-examples
 deactivate
 popd >/dev/null
 
 # ----- Done ------------------------------------------------------------------
 say "Setup complete."
-cat <<'EOF'
+cat <<EOF
 
-  Try the CPU viewer:
+  CPU viewer:
     source venv/bin/activate
-    python main.py scene/luigi.ply
+    gsplat scenes/luigi.ply
 
-  Try the kernel-accelerated viewer:
+  TT viewer (Tenstorrent Wormhole):
     source venv/bin/activate
-    export TT_METAL_HOME=$PWD/tt-metal
-    export TT_METAL_RUNTIME_ROOT=$PWD/tt-metal
-    python main.py scene/luigi.ply --backend kernel
+    export TT_METAL_HOME=\$PWD/${TT_METAL_DIR}
+    export TT_METAL_RUNTIME_ROOT=\$PWD/${TT_METAL_DIR}
+    gsplat scenes/luigi.ply --backend tt
 
 EOF

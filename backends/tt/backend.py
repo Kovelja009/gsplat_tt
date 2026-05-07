@@ -14,7 +14,7 @@ import time
 import numpy as np
 import torch
 
-from rasterization import prepare_kernel_inputs
+from gsplat.rasterization import prepare_kernel_inputs
 
 
 class KernelBackend:
@@ -26,13 +26,13 @@ class KernelBackend:
     payload data; non-protocol log lines on stdout are skipped.
     """
 
-    BINARY_PATH = "tt-metal/build/programming_examples/metal_example_gaussian_splatting"
+    BINARY_PATH = "backends/tt/tt-metal/build/programming_examples/metal_example_gaussian_splatting"
 
     def __init__(self, verbose: bool = False):
         self.verbose = verbose
         env = os.environ.copy()
-        env.setdefault("TT_METAL_HOME", os.path.abspath("tt-metal"))
-        env.setdefault("TT_METAL_RUNTIME_ROOT", os.path.abspath("tt-metal"))
+        env.setdefault("TT_METAL_HOME", os.path.abspath("backends/tt/tt-metal"))
+        env.setdefault("TT_METAL_RUNTIME_ROOT", os.path.abspath("backends/tt/tt-metal"))
         self._proc = subprocess.Popen(
             [self.BINARY_PATH, "--daemon"],
             stdin=subprocess.PIPE,

@@ -320,18 +320,21 @@ constexpr size_t TILE_IDS_PAGE_BYTES = 64;
 // 4/3-approximation of the optimal makespan; usually within a few percent of
 // perfect on our workloads. Returns a per-core list of tile IDs.
 //
-// Implementation note: cores accumulate `max(cost, 1)` rather than `cost`, so
-// 0-cost (empty) tiles round-robin across cores instead of piling on the same
-// one. Without that bump, std::min_element returns the same core for every
-// empty tile (load doesn't change), and a typical scene with most tiles empty
-// would put 100+ tile IDs on one core, overflowing the reader's L1 cache.
+// Empty tiles (cost == 0) are filtered out and never reach the kernel. This
+// is correctness-critical, not just a perf optimization: dispatching the full
+// CB pump (TILE_META + PX + PY + state CBs + COLOR_OUT) for thousands of
+// empty tiles per frame triggers a producer/consumer CB deadlock at >= 16
+// active cores. The host pre-zeros the output buffer in process_frame() so
+// skipped tile slots show as black instead of stale DRAM content.
 static std::vector<std::vector<uint32_t>> compute_lpt_assignment(
     const std::vector<float>& offsets_f32, uint32_t num_tiles, uint32_t num_cores) {
     std::vector<std::pair<uint32_t, uint32_t>> cost_id;
     cost_id.reserve(num_tiles);
     for (uint32_t t = 0; t < num_tiles; t++) {
         const uint32_t cost = static_cast<uint32_t>(offsets_f32[t + 1] - offsets_f32[t]);
-        cost_id.emplace_back(cost, t);
+        if (cost > 0) {
+            cost_id.emplace_back(cost, t);
+        }
     }
     std::sort(cost_id.begin(), cost_id.end(), std::greater<>());
 
@@ -341,7 +344,7 @@ static std::vector<std::vector<uint32_t>> compute_lpt_assignment(
         const auto min_it = std::min_element(core_load.begin(), core_load.end());
         const uint32_t c = static_cast<uint32_t>(std::distance(core_load.begin(), min_it));
         per_core_tile_ids[c].push_back(id);
-        core_load[c] += std::max<uint64_t>(cost, 1);
+        core_load[c] += cost;
     }
     return per_core_tile_ids;
 }
@@ -554,6 +557,13 @@ static double process_frame(DeviceContext& ctx, const FrameInputs& f) {
 
     // 5. Kernel timing window: DRAM upload start -> output readback end.
     const auto t_start = std::chrono::steady_clock::now();
+    // Zero-fill the output buffer. compute_lpt_assignment() filters out
+    // empty tiles, so their slots are never written by the writer kernel.
+    // The DRAM allocator may reuse addresses across frames in daemon mode,
+    // so without this fill, empty regions would show stale pixels.
+    std::vector<uint16_t> output_zero(
+        static_cast<size_t>(num_tiles) * 3 * TILE_H * TILE_W, 0);
+    distributed::EnqueueWriteMeshBuffer(*ctx.cq, bufs.output,   output_zero);
     distributed::EnqueueWriteMeshBuffer(*ctx.cq, bufs.packs,    packs_payload);
     distributed::EnqueueWriteMeshBuffer(*ctx.cq, bufs.offsets,  offsets_u32);
     distributed::EnqueueWriteMeshBuffer(*ctx.cq, bufs.px,       px_bf16);

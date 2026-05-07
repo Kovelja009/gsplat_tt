@@ -7,15 +7,15 @@ import torch
 import viser
 import nerfview
 
-from data_structures import Gaussians
-from kernel_backend import KernelBackend
-from utils import c2w_to_w2c
-from rasterization import (
+from gsplat.data_structures import Gaussians
+from gsplat.utils import c2w_to_w2c
+from gsplat.rasterization import (
     project_gaussians,
     get_tile_assignments,
     sort_and_bin,
     alpha_blend,
 )
+from backends.tt.backend import KernelBackend
 
 
 # Tile size matches the kernel (32x32) for both backends so CPU and
@@ -41,7 +41,7 @@ class GaussianViewer:
         verbose: bool = False,
     ):
         self.gaussians = gaussians
-        self.backend = backend  # "cpu" or "kernel"
+        self.backend = backend  # "cpu" or "tt"
         # Cap longest output dim. Browser tabs ask for arbitrary sizes (often
         # 1920x1080); without a cap, prepare_kernel_inputs takes seconds and
         # the viewer feels frozen. Stretching the displayed image is fine for
@@ -53,17 +53,27 @@ class GaussianViewer:
         # requests during camera movement (smoother drag, pixelated previews).
         self.adaptive_resolution = adaptive_resolution
         self.verbose = verbose
-        if backend == "kernel":
+        if backend == "tt":
             self._kernel = KernelBackend(verbose=verbose)
         else:
             self._kernel = None
 
-        # Compute scene bounds for initial camera placement
-        self._scene_center = gaussians.means.mean(dim=0).numpy()
-        scene_extent = (
-            gaussians.means.max(dim=0).values - gaussians.means.min(dim=0).values
-        ).numpy()
-        self._camera_distance = float(np.linalg.norm(scene_extent)) * 1.5
+        # Compute scene bounds for initial camera placement.
+        # Naive mean / min-max over ALL Gaussians is fragile: trained 3DGS
+        # scenes routinely contain a small number of low-opacity outliers
+        # at extreme positions, which inflate the bounding box and push the
+        # camera so far back that the visible content collapses to a few
+        # center tiles. We instead use percentile bounds restricted to
+        # well-opaque Gaussians, which closely tracks the visible content.
+        means = gaussians.means.numpy()
+        opacities = gaussians.opacities.numpy()
+        visible = means[opacities > 0.1]
+        if visible.shape[0] < 100:
+            visible = means  # fallback for synthetic / very sparse scenes
+        lo = np.percentile(visible, 5, axis=0)
+        hi = np.percentile(visible, 95, axis=0)
+        self._scene_center = (lo + hi) * 0.5
+        self._camera_distance = float(np.linalg.norm(hi - lo)) * 1.2
 
         # Create viser server
         self.server = viser.ViserServer(host=host, port=port, verbose=False)
@@ -219,7 +229,7 @@ class GaussianViewer:
             )
 
         t_blend = time.perf_counter()
-        if self.backend == "kernel":
+        if self.backend == "tt":
             image_np = self._kernel.render(
                 means_2d, covs_2d, colors, opacities,
                 sorted_gaussian_ids, tile_ranges, H, W,

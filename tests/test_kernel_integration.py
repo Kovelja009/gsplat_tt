@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import torch
 
-from rasterization import (
+from gsplat.rasterization import (
     project_gaussians, get_tile_assignments, sort_and_bin,
     alpha_blend, prepare_kernel_inputs,
 )
@@ -16,7 +16,7 @@ from rasterization import (
 
 KERNEL_BINARY = os.environ.get(
     "GSPLAT_KERNEL",
-    "tt-metal/build/programming_examples/metal_example_gaussian_splatting",
+    "backends/tt/tt-metal/build/programming_examples/metal_example_gaussian_splatting",
 )
 
 
@@ -75,8 +75,8 @@ def test_full_scene_psnr():
         np.save(f"{td}/px.npy", px)
         np.save(f"{td}/py.npy", py)
         env = os.environ.copy()
-        env.setdefault("TT_METAL_HOME", os.path.abspath("tt-metal"))
-        env.setdefault("TT_METAL_RUNTIME_ROOT", os.path.abspath("tt-metal"))
+        env.setdefault("TT_METAL_HOME", os.path.abspath("backends/tt/tt-metal"))
+        env.setdefault("TT_METAL_RUNTIME_ROOT", os.path.abspath("backends/tt/tt-metal"))
         subprocess.run([
             KERNEL_BINARY,
             f"{td}/packs.npy", f"{td}/offsets.npy",
@@ -164,8 +164,8 @@ def test_640_perf_baseline():
         np.save(f"{td}/px.npy", px)
         np.save(f"{td}/py.npy", py)
         env = os.environ.copy()
-        env.setdefault("TT_METAL_HOME", os.path.abspath("tt-metal"))
-        env.setdefault("TT_METAL_RUNTIME_ROOT", os.path.abspath("tt-metal"))
+        env.setdefault("TT_METAL_HOME", os.path.abspath("backends/tt/tt-metal"))
+        env.setdefault("TT_METAL_RUNTIME_ROOT", os.path.abspath("backends/tt/tt-metal"))
         t0 = time.perf_counter()
         subprocess.run([
             KERNEL_BINARY,
@@ -223,8 +223,8 @@ def test_640_perf_daemon():
     N = 10_000
 
     env = os.environ.copy()
-    env.setdefault("TT_METAL_HOME", os.path.abspath("tt-metal"))
-    env.setdefault("TT_METAL_RUNTIME_ROOT", os.path.abspath("tt-metal"))
+    env.setdefault("TT_METAL_HOME", os.path.abspath("backends/tt/tt-metal"))
+    env.setdefault("TT_METAL_RUNTIME_ROOT", os.path.abspath("backends/tt/tt-metal"))
 
     proc = subprocess.Popen(
         [KERNEL_BINARY, "--daemon"],

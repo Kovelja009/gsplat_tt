@@ -1,164 +1,134 @@
-# 3D Gaussian Splatting on Tenstorrent Wormhole
+# 3D Gaussian Splatting on Tenstorrent
 
-MSc thesis project: a forward-pass renderer for [3D Gaussian Splatting](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/)
+Forward-pass renderer for [3D Gaussian Splatting](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/)
 running on Tenstorrent's [tt-metal](https://github.com/tenstorrent/tt-metal)
 hardware. Loads a pre-trained `.ply` and renders it interactively in the
-browser via a viser/nerfview viewer.
+browser.
 
-The repo ships two backends behind one viewer:
+MSc thesis project — inference only, no training or backward pass.
 
-- **CPU**: pure PyTorch reference rasterizer. Slow (1-2 s/frame at 256×256)
-  but mathematically clear; serves as the golden reference for kernel correctness.
-- **Kernel**: 3-kernel tt-metal pipeline (reader / compute / writer) running
-  on 64 Tensix cores of a Wormhole device. ~22× faster than the CPU
-  reference on equivalent scenes, ~80 ms/frame at 640×640 on the synthetic
-  test, and sub-second/frame on real Mip-NeRF 360 captures.
+## Backends
 
-## Pipeline
+The same viewer can dispatch to multiple rasterizers:
 
-```
-Load PLY → Project 3D→2D → Tile assignment → Sort by depth → Alpha blend → Display
-            └────────── CPU ──────────┘  └────────── kernel or CPU ───────┘
-```
-
-| Stage | Where | Description |
+| `--backend` | Status | What |
 |---|---|---|
-| Load PLY | CPU | Parse Gaussian attributes (position, scale, rotation, SH colors, opacity); apply activations |
-| Project | CPU (PyTorch) | 3D → 2D via Jacobian linearization of perspective transform; frustum + opacity + radii cull |
-| Tile assignment | CPU | Find which 32×32 screen tiles each Gaussian's bounding circle overlaps |
-| Sort | CPU | Sort (gaussian, tile) pairs by composite key `(tile_id, depth)` |
-| Alpha blend | **CPU or kernel** | Per-tile front-to-back compositing; sat-mask early-termination |
+| `cpu`  | shipping | Pure PyTorch reference. Slow (~1–2 s/frame at 256×256), used as the correctness baseline. |
+| `tt`   | shipping | tt-metal kernels on a Tenstorrent Wormhole device. ~80 ms/frame at 640×640 (21.7× CPU). |
+| `cuda` | planned  | Placeholder; same wrapper interface, CUDA implementation TBD. |
 
-## File structure
-
-### Python (host pipeline + viewer)
+Pipeline (CPU does setup, the chosen backend does the alpha-blend):
 
 ```
-main.py                 — CLI entry (argparse, scene loading, viewer launch)
-viewer.py               — GaussianViewer: nerfview/viser wrapper, dispatches to backend
-kernel_backend.py       — KernelBackend: long-lived daemon-mode IPC wrapper
-rasterization.py        — pipeline stages: project_gaussians, get_tile_assignments,
-                          sort_and_bin, alpha_blend (CPU), prepare_kernel_inputs
-loading_gaussians.py    — PLY parser; applies exp/sigmoid/SH activations at load time
-data_structures.py      — Gaussians dataclass
-utils.py                — math: quaternion → rotation, 3D covariance, c2w → w2c
-tests/                  — numeric_sanity (NumPy reference) + kernel_integration (PSNR)
-scripts/                — fixture dumpers, untilize prototype
+load_ply → project → tile-assign → sort  ──►  alpha_blend (cpu | tt | cuda)
+            └────────────── CPU ──────────┘   └── per-backend rasterizer ──┘
 ```
 
-### tt-metal kernels (Tenstorrent device-side)
-
-```
-tt-metal/tt_metal/programming_examples/gaussian_splatting/
-├── alpha_blend.cpp                       — host driver (single-shot CLI + daemon mode)
-├── alpha_blend_host.h                    — shared CB indices + tile constants
-├── kernels/
-│   ├── compute/alpha_blend_compute.cpp   — per-tile alpha-blend math (BRISC)
-│   └── dataflow/
-│       ├── reader_alpha_blend.cpp        — DRAM → CB streaming (NoC0)
-│       └── writer_alpha_blend.cpp        — CB → DRAM output (NoC1)
-└── CMakeLists.txt
-```
-
-## Setup
-
-One-shot bootstrap (idempotent — safe to re-run):
+## Quick start
 
 ```bash
+# 1) one-shot bootstrap (creates ./venv, vendors tt-metal, builds the kernel)
 ./setup.sh
-```
 
-This:
-
-1. Creates the project venv at `./venv` and installs `requirements.txt`
-2. Clones `tenstorrent/tt-metal` into `./tt-metal` (~5 GB)
-3. Wires our kernel subdir into tt-metal's CMake build
-4. Sets up tt-metal's separate `python_env` (for ttnn / build tools)
-5. Builds tt-metal (`sudo ./build_metal.sh`, ~10-20 min on first run)
-
-To pin a specific tt-metal version: `TT_METAL_REF=v1.2.3 ./setup.sh`.
-
-## Running
-
-### CPU viewer (no Tenstorrent device required)
-
-```bash
+# 2) CPU viewer (no Tenstorrent device required)
 source venv/bin/activate
-python main.py scene/luigi.ply
-```
+gsplat scenes/luigi.ply
 
-### Kernel-accelerated viewer (Wormhole required)
-
-```bash
+# 3) TT viewer (Wormhole device required)
 source venv/bin/activate
-export TT_METAL_HOME=$PWD/tt-metal
-export TT_METAL_RUNTIME_ROOT=$PWD/tt-metal
-python main.py scene/luigi.ply --backend kernel
+export TT_METAL_HOME=$PWD/backends/tt/tt-metal
+export TT_METAL_RUNTIME_ROOT=$PWD/backends/tt/tt-metal
+gsplat scenes/luigi.ply --backend tt
 ```
 
-Then open <http://localhost:8080> in a browser. Orbit the camera with the mouse.
+Then open <http://localhost:8080>. Drag to orbit, **WASD / QE / arrows** to fly.
 
-### Useful flags
+## CLI flags
 
 | Flag | Default | What |
 |---|---|---|
-| `--backend {cpu,kernel}` | `cpu` | Pick rasterizer |
-| `--max-resolution N` | `640` | Cap longest dim of the render (preserves aspect, snaps to multiples of 32). Increase for sharper screenshots, decrease for more interactive drag. |
-| `--adaptive-resolution` | off | Enable nerfview's downsampled drag-frames (smoother camera movement at the cost of pixelated previews while moving) |
-| `-v` / `--verbose` | off | Per-frame stage timing in the terminal (`[render-enter]` / `[render-mid]` / `[kernel-pre]` / `[kernel-post]` / `[render]`) |
-| `--port N` | `8080` | Viewer port |
+| `--backend {cpu,tt}` | `cpu` | Rasterizer (see table above). |
+| `--max-resolution N` | `640`  | Cap on the longest render dim. Snapped to a multiple of 32. |
+| `--adaptive-resolution` | off | Drop to lower res while moving the camera (smoother drag). |
+| `--port N` | `8080` | Viewer port. |
+| `-v` / `--verbose` | off | Per-frame stage timing. |
+
+## Setup details
+
+`./setup.sh` is idempotent and does:
+
+1. Create `./venv`, install `requirements.txt`, and `pip install -e .`
+   (this puts the `gsplat` command on PATH).
+2. Clone `tenstorrent/tt-metal` into `backends/tt/tt-metal/` (~5 GB).
+3. Register our kernel subdir in tt-metal's CMake (`add_subdirectory`).
+4. Build `tt-metal`'s separate `python_env` (for `ttnn` bindings).
+5. `sudo ./build_metal.sh --build-programming-examples` to compile the host
+   binary (`sudo` needed because tt-metal's runtime caches are root-owned).
+
+Pin a specific tt-metal version with `TT_METAL_REF=v1.2.3 ./setup.sh`.
+
+After editing kernel C++ sources, rebuild just the binary:
+
+```bash
+sudo ninja -C backends/tt/tt-metal/build metal_example_gaussian_splatting
+```
+
+## Repository layout
+
+```
+gsplat_tt/
+├── pyproject.toml, setup.sh, README.md, CLAUDE.md, .gitignore
+├── docs/                      # design notes (plan_progress.md, …)
+├── scenes/                    # *.ply (only luigi tracked; others gitignored)
+├── tests/                     # pytest suite
+├── scripts/                   # one-off dev helpers
+├── gsplat/                    # host-side Python package
+│   ├── __main__.py            # CLI entry — installed as `gsplat` console-script
+│   ├── viewer.py              # interactive viewer (viser + nerfview)
+│   ├── rasterization.py       # project, tile, sort, CPU alpha_blend, prep
+│   └── …                      # data_structures, loading_gaussians, utils
+└── backends/                  # one subpackage per accelerator
+    ├── README.md              # how to add a new backend
+    ├── tt/                    # Tenstorrent (tt-metal)
+    │   ├── backend.py         # daemon-subprocess wrapper
+    │   └── tt-metal/          # vendored SDK + our kernels under
+    │       └── tt_metal/programming_examples/gaussian_splatting/
+    └── cuda/                  # placeholder for the future
+```
 
 ## Performance
 
-Scene: 10K random Gaussians at 640×640 (synthetic integration test):
+640×640, 10K random Gaussians:
 
-| Backend | Wall time / frame | Speedup vs CPU |
+| Backend | Frame time | Speedup |
 |---|---|---|
 | CPU PyTorch (16 x86 cores) | ~1740 ms | 1.0× |
-| Tenstorrent **single Tensix core** | ~2515 ms | 0.69× |
-| Tenstorrent 64-core (contiguous split) | ~120 ms | 14.5× |
-| Tenstorrent 64-core (LPT load balancing) | **~80 ms** | **21.7×** |
+| TT, single Tensix core | ~2515 ms | 0.69× |
+| TT, 64 cores (contiguous split) | ~120 ms | 14.5× |
+| **TT, 64 cores (LPT load balancing)** | **~80 ms** | **21.7×** |
 
-Scene: bonsai.ply (1.16M Gaussians, Mip-NeRF 360 capture) at 640×384:
+bonsai.ply (1.16M Gaussians, Mip-NeRF 360) at 640×384:
 
-| Pipeline state | Frame time | Notes |
-|---|---|---|
-| Original (accurate exp, no host culls) | ~6.0 s | baseline |
-| + Approx exp | ~5.1 s | -11 dB PSNR (still 16 dB above 35 dB floor) |
-| + Opacity cull (drop < 1/255 contribution) | ~2.5 s | no PSNR loss |
-| + Radii cap (drop projection-breakdown blobs) | **~0.6-0.9 s** | **~10× cumulative** + visual artifact fix |
+| State | Frame time |
+|---|---|
+| Naive (accurate exp, no culls) | ~6.0 s |
+| + approx exp | ~5.1 s |
+| + opacity cull (< 1/255) | ~2.5 s |
+| **+ radius cap** | **~0.6–0.9 s** |
 
 ## Testing
 
 ```bash
 source venv/bin/activate
-python -m pytest tests/ -v -s
+pytest tests/
 ```
 
-| Test | What | Hardware needed |
-|---|---|---|
-| `test_numeric_sanity.py` | NumPy reference vs CPU rasterizer | none |
-| `test_kernel_integration.py::test_full_scene_psnr` | PSNR ≥ 35 dB / SSIM ≥ 0.98 vs CPU on a 64×64 / 50-Gaussian scene | Wormhole |
-| `test_kernel_integration.py::test_640_perf_baseline` | 640×640 / 10K-Gaussian one-shot perf measurement | Wormhole |
-| `test_kernel_integration.py::test_640_perf_daemon` | Same scene through the persistent daemon (init amortized) | Wormhole |
-
-## Known issues
-
-See `plan_progress.md` for full details:
-
-- **KI-1 — T0.6 saturation edge artifacts**: a 32×32 tile with 50+ stacked
-  α=0.99 Gaussians causes edge pixels to saturate to a bf16-representable
-  garbage value (0x4790 = 73728). Realistic scenes don't trigger it; T0.6
-  is shipped as a known-failing reproducer.
-
-- **KI-2 — Multi-tile dispatch deadlock**: at certain "sparse populated tile"
-  configurations (~18+ populated tiles each with ~6+ entries on a 1M+
-  Gaussian scene), the kernel daemon hangs deterministically. Workaround:
-  stick to `--max-resolution ≤ 640` for the interactive viewer.
+`test_numeric_sanity.py` runs anywhere; the three `test_kernel_integration.py`
+tests need a Tenstorrent device.
 
 ## References
 
-- [3D Gaussian Splatting (INRIA)](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/) — the paper this implements
-- [tenstorrent/tt-metal](https://github.com/tenstorrent/tt-metal) — the runtime and SDK
-- [hbb1/torch-splatting](https://github.com/hbb1/torch-splatting) — pure-PyTorch reference
-- [graphdeco-inria/diff-gaussian-rasterization](https://github.com/graphdeco-inria/diff-gaussian-rasterization) — original CUDA implementation
+- [3D Gaussian Splatting (INRIA)](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/) — the paper
+- [tenstorrent/tt-metal](https://github.com/tenstorrent/tt-metal) — runtime + SDK
+- [hbb1/torch-splatting](https://github.com/hbb1/torch-splatting) — PyTorch reference
+- [graphdeco-inria/diff-gaussian-rasterization](https://github.com/graphdeco-inria/diff-gaussian-rasterization) — original CUDA rasterizer

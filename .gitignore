@@ -217,26 +217,40 @@ __marimo__/
 
 .claude/
 
-# Thesis plan for easier navigation
-thesis_plan.md
+# Thesis plan for easier navigation (private working doc, not for upstream)
+docs/thesis_plan.md
 
 # Vendored tt-metal tree — ignore contents except our programming_examples/gaussian_splatting subdir
-/tt-metal/*
-!/tt-metal/tt_metal
-/tt-metal/tt_metal/*
-!/tt-metal/tt_metal/programming_examples
-/tt-metal/tt_metal/programming_examples/*
-!/tt-metal/tt_metal/programming_examples/gaussian_splatting
+/backends/tt/tt-metal/*
+!/backends/tt/tt-metal/tt_metal
+/backends/tt/tt-metal/tt_metal/*
+!/backends/tt/tt-metal/tt_metal/programming_examples
+/backends/tt/tt-metal/tt_metal/programming_examples/*
+!/backends/tt/tt-metal/tt_metal/programming_examples/gaussian_splatting
+
+# Defensive: pre-reorg tt-metal location (in case anything ever re-clones there)
+/tt-metal/
 
 # claude-mem auto-context files (allow only the root project CLAUDE.md)
 **/CLAUDE.md
 !/CLAUDE.md
 
-# tt-metal runtime artifacts (DPRINT, watcher logs, profiler output)
+# Runtime artifacts: tt-metal DPRINT / watcher / profiler output. Generated
+# under /generated (legacy root location) or under the vendored SDK.
 /generated/
+/backends/tt/tt-metal/generated/
+
+# pip install -e . creates this metadata dir at the repo root; not for git.
+/gsplat_tt.egg-info/
+
+# IDE / editor settings — uncomment to also ignore .idea/ if you don't use JetBrains
+.vscode/
 
 # Scene files: only luigi.ply (~1 MB) is small enough to track. The Mip-NeRF 360
 # captures (bonsai/train/truck/...) are 100s of MB and exceed GitHub's per-file
-# limit; users download those from the dataset directly.
-/scene/*.ply
-!/scene/luigi.ply
+# limit; users download those from the dataset directly. Screenshots/captures
+# in scenes/ also stay local by default — `git add -f scenes/<file>.png` if you
+# want to keep one.
+/scenes/*.ply
+!/scenes/luigi.ply
+/scenes/*.png

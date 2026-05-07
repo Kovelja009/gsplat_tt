@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gsplat_tt"
+version = "0.1.0"
+description = "3D Gaussian Splatting forward-pass renderer with Tenstorrent (tt-metal) backend"
+requires-python = ">=3.10"
+dynamic = ["dependencies"]
+
+[tool.setuptools]
+packages = ["gsplat", "backends", "backends.tt", "backends.cuda"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[project.scripts]
+gsplat = "gsplat.__main__:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

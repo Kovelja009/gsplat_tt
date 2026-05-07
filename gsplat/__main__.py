@@ -1,7 +1,7 @@
 import argparse
 
-from loading_gaussians import load_ply
-from viewer import GaussianViewer
+from gsplat.loading_gaussians import load_ply
+from gsplat.viewer import GaussianViewer
 
 
 def main():
@@ -17,9 +17,9 @@ def main():
     )
     parser.add_argument(
         "--backend",
-        choices=["cpu", "kernel"],
+        choices=["cpu", "tt"],
         default="cpu",
-        help="Rendering backend (default: cpu)",
+        help="Rendering backend: cpu (PyTorch reference) or tt (Tenstorrent kernel). Default: cpu.",
     )
     parser.add_argument(
         "--max-resolution",

@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 
-from utils import build_covariance_3d
+from gsplat.utils import build_covariance_3d
 
 
 def project_gaussians(
@@ -446,15 +446,6 @@ def prepare_kernel_inputs(
     # equivalent and ~100x faster.
     total_entries = gids_np.shape[0]
     attribute_packs = np.empty((total_entries, 9), dtype=np.float32)
-    attribute_packs[:, 0] = means_np[gids_np, 0]
-    attribute_packs[:, 1] = means_np[gids_np, 1]
-    attribute_packs[:, 2] = cov_inv_a[gids_np]
-    attribute_packs[:, 3] = 2.0 * cov_inv_b[gids_np]
-    attribute_packs[:, 4] = cov_inv_c[gids_np]
-    attribute_packs[:, 5] = colors_np[gids_np, 0]
-    attribute_packs[:, 6] = colors_np[gids_np, 1]
-    attribute_packs[:, 7] = colors_np[gids_np, 2]
-    attribute_packs[:, 8] = opacities_np[gids_np]
 
     # tile_offsets: cumulative count up to each tile, plus a final total.
     # Equivalent to walking tile_ranges in order, since sort_and_bin produces
@@ -462,6 +453,26 @@ def prepare_kernel_inputs(
     counts = (ranges_np[:, 1] - ranges_np[:, 0]).astype(np.uint32)
     tile_offsets = np.zeros(num_tiles + 1, dtype=np.uint32)
     tile_offsets[1:] = np.cumsum(counts)
+
+    # Per-entry tile origin: subtract from each Gaussian's mean so the pack
+    # stores tile-LOCAL means matching the tile-local px/py grid. This keeps
+    # all coordinates in a small range where bf16 has sub-0.25 precision —
+    # without this, right-side tiles at high resolution stored mean_x/px in
+    # bf16's coarse range (step = 8 in [1024, 2048)) and produced visible
+    # ~8-pixel blocky stripes.
+    tile_id_per_entry = np.repeat(np.arange(num_tiles, dtype=np.int32), counts)
+    tile_origin_x = (tile_id_per_entry % tiles_x).astype(np.float32) * 32.0
+    tile_origin_y = (tile_id_per_entry // tiles_x).astype(np.float32) * 32.0
+
+    attribute_packs[:, 0] = means_np[gids_np, 0] - tile_origin_x
+    attribute_packs[:, 1] = means_np[gids_np, 1] - tile_origin_y
+    attribute_packs[:, 2] = cov_inv_a[gids_np]
+    attribute_packs[:, 3] = 2.0 * cov_inv_b[gids_np]
+    attribute_packs[:, 4] = cov_inv_c[gids_np]
+    attribute_packs[:, 5] = colors_np[gids_np, 0]
+    attribute_packs[:, 6] = colors_np[gids_np, 1]
+    attribute_packs[:, 7] = colors_np[gids_np, 2]
+    attribute_packs[:, 8] = opacities_np[gids_np]
 
     # px/py grids depend only on (H, W) — cache them per resolution. During
     # interactive viewing the same resolution is reused thousands of times;
@@ -481,10 +492,19 @@ _px_py_cache: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
 def _get_px_py_grids(image_height: int, image_width: int) -> tuple[np.ndarray, np.ndarray]:
     """Return (px_tiles, py_tiles) of shape (num_tiles, 32, 32) — cached.
 
-    Each tile (ty, tx) has:
-        px[i, j] = tx * 32 + j + 0.5
-        py[i, j] = ty * 32 + i + 0.5
-    in global screen coordinates (independent of camera and Gaussians).
+    Each tile stores **tile-local** pixel coordinates:
+        px[i, j] = j + 0.5
+        py[i, j] = i + 0.5
+    Same grid for every tile. Per-Gaussian `mean_x`, `mean_y` in the packs
+    are pre-shifted by the tile's origin, so `dx = px - mean_x` produces
+    the same value as global coords would.
+
+    Why tile-local: the kernel stores px/py as bf16 in CB_PX/CB_PY. bf16
+    has 7 mantissa bits → for values in [1024, 2048) the representable
+    step is 8, so adjacent pixels in right-side tiles of a 1920-wide
+    render would round to the same px and produce identical output —
+    visible as ~8-pixel-wide blocky stripes on the right side. Tile-local
+    coords stay in [0, 32) where bf16 has sub-0.25 precision.
     """
     key = (image_height, image_width)
     cached = _px_py_cache.get(key)
@@ -494,14 +514,14 @@ def _get_px_py_grids(image_height: int, image_width: int) -> tuple[np.ndarray, n
     tiles_x = (image_width + 31) // 32
     tiles_y = (image_height + 31) // 32
     num_tiles = tiles_x * tiles_y
-    tids = np.arange(num_tiles, dtype=np.int32)
-    ty = (tids // tiles_x).astype(np.float32)
-    tx = (tids % tiles_x).astype(np.float32)
     i_grid = np.arange(32, dtype=np.float32)
     j_grid = np.arange(32, dtype=np.float32)
-    px_tiles = np.empty((num_tiles, 32, 32), dtype=np.float32)
-    py_tiles = np.empty((num_tiles, 32, 32), dtype=np.float32)
-    px_tiles[:] = tx[:, None, None] * 32.0 + j_grid[None, None, :] + 0.5
-    py_tiles[:] = ty[:, None, None] * 32.0 + i_grid[None, :, None] + 0.5
+    # Single tile-local grid, broadcast to all num_tiles slots.
+    px_tiles = np.broadcast_to(
+        (j_grid + 0.5)[None, None, :], (num_tiles, 32, 32)
+    ).copy()
+    py_tiles = np.broadcast_to(
+        (i_grid + 0.5)[None, :, None], (num_tiles, 32, 32)
+    ).copy()
     _px_py_cache[key] = (px_tiles, py_tiles)
     return px_tiles, py_tiles

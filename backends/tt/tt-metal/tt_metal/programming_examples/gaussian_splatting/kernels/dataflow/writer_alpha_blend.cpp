@@ -6,7 +6,8 @@
 
 #include "api/dataflow/dataflow_api.h"
 
-// Alpha-blend WRITER kernel (NCRISC, NoC1).
+// Alpha-blend WRITER kernel (BRISC, NoC0; see DataMovementProcessor::RISCV_0
+// in alpha_blend.cpp).
 //
 // ROLE
 // ----
@@ -14,7 +15,7 @@
 // core processed, the compute kernel pushes 3 bf16 32x32 tiles (R, G, B in
 // that order) to CB_COLOR_OUT. We async-write them to consecutive DRAM
 // pages at offsets `3*screen_tile + {0, 1, 2}` of the output buffer. The
-// writer uses NoC1 while the reader uses NoC0 — bidirectional dual-NoC
+// writer uses NoC0 while the reader uses NoC1 — bidirectional dual-NoC
 // torus lets I/O overlap.
 //
 // LPT TILE ASSIGNMENT

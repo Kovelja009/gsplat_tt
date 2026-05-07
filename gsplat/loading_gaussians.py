@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from plyfile import PlyData
-from data_structures import Gaussians
+from gsplat.data_structures import Gaussians
 
 
 def activate_scales(raw_scales: torch.Tensor) -> torch.Tensor:
@@ -66,7 +66,7 @@ def load_ply(path: str) -> Gaussians:
 
 
 if __name__ == "__main__":
-    gaussians = load_ply("scene/luigi.ply")
+    gaussians = load_ply("scenes/luigi.ply")
     print(f"Loaded {gaussians.num_gaussians} Gaussians")
     print(f"  means:     {gaussians.means.shape}  range [{gaussians.means.min():.3f}, {gaussians.means.max():.3f}]")
     print(f"  scales:    {gaussians.scales.shape}  range [{gaussians.scales.min():.4f}, {gaussians.scales.max():.4f}]")

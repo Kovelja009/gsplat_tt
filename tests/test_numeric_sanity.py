@@ -72,7 +72,7 @@ def test_empty_tile():
 
 
 import torch
-from rasterization import alpha_blend, prepare_kernel_inputs
+from gsplat.rasterization import alpha_blend, prepare_kernel_inputs
 
 
 def test_prepare_kernel_inputs_matches_cpu_alpha_blend():
@@ -90,7 +90,7 @@ def test_prepare_kernel_inputs_matches_cpu_alpha_blend():
     depths = torch.arange(N, dtype=torch.float32)
 
     # Simple tile assignment: all Gaussians to all tiles
-    from rasterization import get_tile_assignments, sort_and_bin
+    from gsplat.rasterization import get_tile_assignments, sort_and_bin
     radii = torch.full((N,), 10.0)
     gaussian_ids, tile_ids, _ = get_tile_assignments(means_2d, radii, H, W, tile_size=32)
     sorted_gaussian_ids, tile_ranges = sort_and_bin(

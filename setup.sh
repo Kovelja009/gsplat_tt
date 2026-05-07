@@ -6,10 +6,9 @@
 # Steps:
 #   1. Project venv at ./venv with requirements.txt + `pip install -e .`
 #   2. Vendor tt-metal into backends/tt/tt-metal/ (~5 GB clone)
-#   3. Drop the embedded .git so the parent repo can track our kernel subdir
-#   4. Register our kernel subdir in tt-metal's programming_examples CMake
-#   5. Set up tt-metal's python_env (separate venv with ttnn bindings)
-#   6. Build tt-metal (requires sudo for SFPI / .cpmcache)
+#   3. Register our kernel subdir in tt-metal's programming_examples CMake
+#   4. Build tt-metal C++ libs + our kernel host binary
+#      (requires sudo for SFPI / .cpmcache; ~10-20 min on first run)
 #
 # Usage:
 #   ./setup.sh
@@ -98,29 +97,24 @@ else
     say "gaussian_splatting subdir already registered"
 fi
 
-# ----- 4. tt-metal python_env (ttnn bindings) -------------------------------
-if [ -d "$TT_METAL_DIR/python_env" ]; then
-    say "$TT_METAL_DIR/python_env already present, skipping"
-else
-    say "Setting up $TT_METAL_DIR/python_env (ttnn bindings; takes a few minutes)"
-    pushd "$TT_METAL_DIR" >/dev/null
-    [ -x "./create_venv.sh" ] || fail "create_venv.sh missing/not executable in $TT_METAL_DIR"
-    ./create_venv.sh
-    popd >/dev/null
-fi
-
-# ----- 5. Build tt-metal + our kernel ---------------------------------------
-# `--build-programming-examples` is required so tt-metal's CMake includes
-# `programming_examples/`, which contains our gaussian_splatting subproject.
-# Without the flag, BUILD_PROGRAMMING_EXAMPLES=OFF and the
-# `metal_example_gaussian_splatting` target is never created.
+# ----- 4. Build tt-metal + our kernel ---------------------------------------
+# Flags:
+#   --build-programming-examples   pulls in programming_examples/ and thus our
+#                                  gaussian_splatting subproject (otherwise the
+#                                  `metal_example_gaussian_splatting` target is
+#                                  never created).
+#   --without-python-bindings      skips the `ttnn` Python wheel build. We only
+#                                  need the C++ tt-metal libs and our binary —
+#                                  `backends/tt/backend.py` invokes the binary
+#                                  as a subprocess, so the runtime never imports
+#                                  `ttnn`. Skipping it also avoids tt-metal's
+#                                  separate `python_env`/`create_venv.sh` step,
+#                                  which can fail with editable-install errors
+#                                  on newer setuptools.
 say "Building tt-metal + gaussian_splatting kernel (sudo required for SFPI / CPM caches)"
 warn "First build can take 10-20 minutes."
 pushd "$TT_METAL_DIR" >/dev/null
-# shellcheck disable=SC1091
-source python_env/bin/activate
-sudo ./build_metal.sh --build-programming-examples
-deactivate
+sudo ./build_metal.sh --build-programming-examples --without-python-bindings
 popd >/dev/null
 
 # ----- Done ------------------------------------------------------------------

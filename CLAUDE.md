@@ -81,32 +81,33 @@ Key tt-metal constants we use:
 - Validate the kernel against the CPU reference via PSNR/SSIM (≥35 dB target).
 - Render at 480-960px range for interactive use; 4K is the design ceiling.
 
-## Two venvs
+## Project venv
 
-Two separate Python environments, kept apart:
-- **Project venv** (`./venv`) — host-side Python: viewer, CPU pipeline, tests.
-  - Activate: `source venv/bin/activate`
-  - Used by: `gsplat ...`, `pytest`, anything in `gsplat/` or `tests/`.
-- **tt-metal python_env** (`./backends/tt/tt-metal/python_env`) — has the
-  `ttnn` bindings; needed only for the kernel build / standalone tt-metal
-  Python scripts (rare).
-  - Activate: `source backends/tt/tt-metal/python_env/bin/activate`
+The host-side Python (viewer, CPU pipeline, tests, kernel-backend wrapper)
+lives in `./venv`:
+- Activate: `source venv/bin/activate`
+- Used by: `gsplat ...`, `pytest`, anything in `gsplat/` or `tests/`.
 
-Always `deactivate` before switching. The two are not interchangeable.
+Note: tt-metal's `ttnn` Python bindings (and the separate `python_env` they
+need) are intentionally **not built** by setup. Our runtime only invokes
+the C++ binary as a subprocess, so we pass `--without-python-bindings` to
+`build_metal.sh` and skip `create_venv.sh`. If you ever need `ttnn`
+directly, run tt-metal's `create_venv.sh` manually inside
+`backends/tt/tt-metal/`.
 
 ## Setup
 
 `./setup.sh` is the single canonical bootstrap. It is idempotent. Steps:
 
 1. Creates `./venv`, installs `requirements.txt`, runs `pip install -e .`.
-2. Clones `tenstorrent/tt-metal` into `backends/tt/tt-metal/` (~5 GB).
-3. Drops the embedded `.git` so our parent repo can track the kernel subdir.
-4. Adds `add_subdirectory(gaussian_splatting)` to tt-metal's
+2. Vendors `tenstorrent/tt-metal` into `backends/tt/tt-metal/` (~5 GB; the
+   target dir already contains our tracked kernel subdir, so the script
+   clones to a temp location and merges with `cp -rn`).
+3. Adds `add_subdirectory(gaussian_splatting)` to tt-metal's
    `programming_examples/CMakeLists.txt`.
-5. Builds `backends/tt/tt-metal/python_env` via tt-metal's `create_venv.sh`.
-6. `sudo ./build_metal.sh` to compile the host binary (sudo needed because
-   tt-metal's `runtime/sfpi/` and `.cpmcache/` are root-owned from initial
-   install).
+4. `sudo ./build_metal.sh --build-programming-examples --without-python-bindings`
+   to compile the C++ libs + our kernel host binary. `sudo` needed for
+   tt-metal's root-owned SFPI / CPM caches.
 
 Pin a tt-metal version with `TT_METAL_REF=v1.2.3 ./setup.sh`.
 

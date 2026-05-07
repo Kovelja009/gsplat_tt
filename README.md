@@ -61,9 +61,10 @@ Then open <http://localhost:8080>. Drag to orbit, **WASD / QE / arrows** to fly.
    (this puts the `gsplat` command on PATH).
 2. Clone `tenstorrent/tt-metal` into `backends/tt/tt-metal/` (~5 GB).
 3. Register our kernel subdir in tt-metal's CMake (`add_subdirectory`).
-4. Build `tt-metal`'s separate `python_env` (for `ttnn` bindings).
-5. `sudo ./build_metal.sh --build-programming-examples` to compile the host
-   binary (`sudo` needed because tt-metal's runtime caches are root-owned).
+4. `sudo ./build_metal.sh --build-programming-examples --without-python-bindings`
+   to compile the C++ libs + our kernel host binary. `sudo` is needed for
+   tt-metal's root-owned SFPI / CPM caches; we skip the `ttnn` Python wheel
+   because the runtime only invokes the binary as a subprocess.
 
 Pin a specific tt-metal version with `TT_METAL_REF=v1.2.3 ./setup.sh`.
 

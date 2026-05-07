@@ -56,15 +56,27 @@ pip install -e .
 deactivate
 
 # ----- 2. Vendor tt-metal ----------------------------------------------------
-mkdir -p "$(dirname "$TT_METAL_DIR")"
-if [ ! -d "$TT_METAL_DIR" ]; then
-    say "Cloning tenstorrent/tt-metal into $TT_METAL_DIR (~5 GB, may take several minutes)"
+# Our repo tracks the kernel subdir at
+#   $TT_METAL_DIR/tt_metal/programming_examples/gaussian_splatting/
+# so $TT_METAL_DIR is *partially populated* on a fresh clone (just the kernel
+# subdir, no upstream tt-metal). Detect "needs vendoring" by looking for an
+# upstream-only marker file (build_metal.sh) rather than the directory.
+# `git clone` can't target a non-empty dir, so we clone to a temp location and
+# merge upstream files in with `cp -rn` (no-clobber preserves our tracked
+# kernel subdir).
+mkdir -p "$TT_METAL_DIR"
+if [ ! -f "$TT_METAL_DIR/build_metal.sh" ]; then
+    say "Vendoring tenstorrent/tt-metal into $TT_METAL_DIR (~5 GB, may take several minutes)"
+    tmp_clone=$(mktemp -d -t gsplat_tt_setup_XXXXXX)
+    trap 'rm -rf "$tmp_clone"' EXIT
     git clone --recurse-submodules --branch "$TT_METAL_REF" \
-        "$TT_METAL_REPO" "$TT_METAL_DIR"
-elif [ ! -d "$TT_METAL_DIR/tt_metal" ]; then
-    fail "$TT_METAL_DIR exists but doesn't look like a tt-metal checkout. Remove it before re-running setup."
+        "$TT_METAL_REPO" "$tmp_clone/tt-metal"
+    rm -rf "$tmp_clone/tt-metal/.git"
+    cp -rn "$tmp_clone/tt-metal/." "$TT_METAL_DIR/"
+    rm -rf "$tmp_clone"
+    trap - EXIT
 else
-    say "$TT_METAL_DIR already present, skipping clone"
+    say "$TT_METAL_DIR already vendored, skipping clone"
 fi
 
 # Drop embedded .git so the parent repo can track files inside the vendored

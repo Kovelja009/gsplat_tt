@@ -1,6 +1,10 @@
 """Browser-based interactive viewer for 3D Gaussian Splatting scenes."""
 import os
+import statistics
 import time
+from datetime import datetime
+from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -16,6 +20,29 @@ from gsplat.utils import c2w_to_w2c
 # Tile size matches the kernel (32x32) for both backends so CPU and
 # kernel renders use the same tiling and are directly comparable.
 TILE_SIZE = 32
+
+# Pipeline stages, in execution order — used to lay out the benchmark table.
+_STAGE_KEYS = ("project", "tile_assign", "sort", "blend")
+
+
+class _FrameSample(NamedTuple):
+    """One frame's per-stage timings plus the (W, H) it was rendered at."""
+    timings: dict[str, float]
+    sub_timings: dict[str, float]
+    width: int
+    height: int
+
+
+def _median_by_key(
+    rows: list[dict[str, float]], keys: list[str] | tuple[str, ...]
+) -> dict[str, float]:
+    """Median of `row[key]` across rows, skipping rows where the key is absent."""
+    out: dict[str, float] = {}
+    for key in keys:
+        values = [r[key] for r in rows if key in r]
+        if values:
+            out[key] = statistics.median(values)
+    return out
 
 
 class GaussianViewer:
@@ -35,27 +62,31 @@ class GaussianViewer:
         port: int = 8080,
         backend: str = "cpu",
         max_resolution: int = 640,
-        adaptive_resolution: bool = False,
         verbose: bool = False,
+        scene_path: str | None = None,
     ):
         self.gaussians = gaussians
         self.backend_name = backend
-        # Cap longest output dim. Browser tabs ask for arbitrary sizes (often
-        # 1920x1080); without a cap, prepare_kernel_inputs takes seconds and
-        # the viewer feels frozen. Stretching the displayed image is fine for
-        # interactive preview.
+        # Path to the .ply this viewer was launched with — used as the scene
+        # name in the benchmark markdown filename (None for synthetic data).
+        self.scene_path = scene_path
+        # Shorter render dim, in pixels (e.g. 720 ≈ 720p). The longer dim
+        # follows from the browser's aspect ratio; rendering at native browser
+        # size makes prepare_kernel_inputs take seconds and the viewer feels
+        # frozen. Stretching the displayed image is fine for interactive use.
         self.max_resolution = max_resolution
-        # If False (default), always render at max_resolution on the longest
-        # dim regardless of nerfview's adaptive-downsample requests. Looks
-        # better, dragging is choppier. If True, honor nerfview's smaller
-        # requests during camera movement (smoother drag, pixelated previews).
-        self.adaptive_resolution = adaptive_resolution
         self.verbose = verbose
 
         # Spin up the backend lazily through the registry, then wrap it in a
         # Pipeline so per-stage timing happens automatically.
         self.pipeline = Pipeline(get_backend(backend, verbose=verbose),
                                  tile_size=TILE_SIZE)
+
+        # Per-frame timing log; aggregated into a markdown report on shutdown.
+        # Empty frames (no visible Gaussians) are skipped so they don't pull
+        # the median toward zero.
+        self._frame_samples: list[_FrameSample] = []
+        self._session_start = datetime.now()
 
         # Compute scene bounds for initial camera placement.
         # Naive mean / min-max over ALL Gaussians is fragile: trained 3DGS
@@ -99,8 +130,6 @@ class GaussianViewer:
 
         self._running = False
         flags = [f"backend={backend}", f"max_resolution={max_resolution}"]
-        if adaptive_resolution:
-            flags.append("adaptive_resolution")
         if verbose:
             flags.append("verbose")
         print(
@@ -113,19 +142,10 @@ class GaussianViewer:
     ) -> tuple[int, int, int, int]:
         """Pick (W, H) for this frame.
 
-        nerfview adapts its requests on the fly: small dims during camera
-        movement (low_move state), full viewer_res when static. We use
-        `req_W / req_H` only as the aspect ratio; the actual render size
-        depends on `adaptive_resolution`:
-
-          - False (default): always render at max_resolution on the longest
-            dim (preserving aspect). Every frame is full-quality; dragging
-            is choppier.
-          - True: honor whatever nerfview asks for, capped at max_resolution
-            on the longest dim. Smooth dragging via downsampled previews;
-            full quality when static.
-
-        Snaps both dims to multiples of 32 so the kernel gets whole tiles.
+        max_resolution sets the shorter dim (480p/720p/1080p convention);
+        the longer dim follows from the browser's aspect ratio. Both dims
+        are snapped down to multiples of TILE_SIZE so the kernel gets whole
+        tiles.
 
         Returns (req_W, req_H, W, H) — the original request alongside the
         resolved size, useful for logging.
@@ -140,22 +160,13 @@ class GaussianViewer:
         if req_W <= 0 or req_H <= 0:
             return req_W, req_H, max(req_W, 1), max(req_H, 1)
 
-        if self.adaptive_resolution:
-            # Honor nerfview's adaptive size, capped from above.
-            W, H = req_W, req_H
-            if max(W, H) > self.max_resolution:
-                scale = self.max_resolution / max(W, H)
-                W = int(W * scale)
-                H = int(H * scale)
-        else:
-            # Always target max_resolution on the longest dim, keep aspect.
-            aspect = req_W / req_H
-            if aspect >= 1.0:
-                W = self.max_resolution
-                H = int(self.max_resolution / aspect)
-            else:
-                H = self.max_resolution
-                W = int(self.max_resolution * aspect)
+        aspect = req_W / req_H
+        if aspect >= 1.0:  # landscape: H is the shorter dim
+            H = self.max_resolution
+            W = int(self.max_resolution * aspect)
+        else:  # portrait: W is the shorter dim
+            W = self.max_resolution
+            H = int(self.max_resolution / aspect)
 
         W = max(TILE_SIZE, (W // TILE_SIZE) * TILE_SIZE)
         H = max(TILE_SIZE, (H // TILE_SIZE) * TILE_SIZE)
@@ -193,6 +204,14 @@ class GaussianViewer:
             image_np = np.zeros((H, W, 3), dtype=np.uint8)
         else:
             image_np = (np.clip(result.image, 0.0, 1.0) * 255).astype(np.uint8)
+            # Empty frames (no visible Gaussians) short-circuit the pipeline
+            # and would skew the median toward zero, so they're not recorded.
+            self._frame_samples.append(_FrameSample(
+                timings=dict(result.timings),
+                sub_timings=dict(result.sub_timings),
+                width=W,
+                height=H,
+            ))
 
         wall_elapsed = time.perf_counter() - wall_start
         if self.verbose:
@@ -230,6 +249,87 @@ class GaussianViewer:
             f"**Visible:** {num_visible:,}"
         )
 
+    @property
+    def _scene_name(self) -> str:
+        return Path(self.scene_path).stem if self.scene_path else "synthetic"
+
+    def _aggregate_session_medians(
+        self,
+    ) -> tuple[dict[str, float], dict[str, float], list[str], float, tuple[int, int]]:
+        """Aggregate per-stage / sub-timing / total medians and modal (W, H)."""
+        stage_rows = [s.timings for s in self._frame_samples]
+        sub_rows = [s.sub_timings for s in self._frame_samples]
+        sub_keys = list(dict.fromkeys(k for s in sub_rows for k in s))
+
+        stage_medians = _median_by_key(stage_rows, _STAGE_KEYS)
+        sub_medians = _median_by_key(sub_rows, sub_keys)
+        median_total = _median_by_key(stage_rows, ("total",)).get("total", 0.0)
+        modal_resolution = statistics.mode(
+            (s.width, s.height) for s in self._frame_samples
+        )
+        return stage_medians, sub_medians, sub_keys, median_total, modal_resolution
+
+    def _benchmark_filename(self) -> str:
+        ts = self._session_start.strftime("%Y-%m-%d_%H-%M-%S")
+        return f"{self._scene_name}_{self.backend_name}_{self.max_resolution}_{ts}.md"
+
+    def _render_benchmark_md(
+        self,
+        stage_medians: dict[str, float],
+        sub_medians: dict[str, float],
+        sub_keys: list[str],
+        median_total: float,
+        modal_resolution: tuple[int, int],
+    ) -> str:
+        fps = 1000.0 / median_total if median_total > 0 else 0.0
+        ts = self._session_start
+        res_w, res_h = modal_resolution
+        resolution = f"{res_w}x{res_h} (max-resolution={self.max_resolution})"
+
+        rows = ["| Stage | ms |", "|---|---|"]
+        for stage in _STAGE_KEYS:
+            if stage in stage_medians:
+                rows.append(f"| {stage} | {stage_medians[stage]:.2f} |")
+            for sub in sub_keys:
+                if not sub.startswith(f"{stage}.") or sub not in sub_medians:
+                    continue
+                # Dotted depth = nesting level under the stage; e.g.
+                # "blend.daemon_rt.device_kernel" is depth 2 → indent twice.
+                # Markdown table renderers collapse leading whitespace inside
+                # cells, so we use &nbsp; to make the indent survive.
+                depth = sub.count(".")
+                leaf = sub.rsplit(".", 1)[-1]
+                indent = "&nbsp;" * 4 * depth
+                rows.append(f"| {indent}└─ {leaf} | {sub_medians[sub]:.2f} |")
+        rows.append(f"| **Total** | **{median_total:.2f}** |")
+        rows.append(f"| **FPS** | **{fps:.2f}** |")
+
+        return "\n".join([
+            f"# Benchmark: {self._scene_name}",
+            "",
+            f"- **Date:** {ts.strftime('%Y-%m-%d')}",
+            f"- **Time:** {ts.strftime('%H:%M:%S')}",
+            f"- **Backend:** {self.backend_name}",
+            f"- **Scene:** {self.scene_path or '(synthetic)'}",
+            f"- **Gaussians:** {self.gaussians.num_gaussians:,}",
+            f"- **Resolution:** {resolution}",
+            f"- **Frames sampled:** {len(self._frame_samples)}",
+            "",
+            "## Performance (median across frames)",
+            "",
+            *rows,
+            "",
+        ])
+
+    def _write_benchmark(self) -> None:
+        if not self._frame_samples:
+            return
+        out_dir = Path("benchmarks")
+        out_dir.mkdir(exist_ok=True)
+        path = out_dir / self._benchmark_filename()
+        path.write_text(self._render_benchmark_md(*self._aggregate_session_medians()))
+        print(f"Benchmark written to {path}", flush=True)
+
     def run(self) -> None:
         """Block the main thread to keep the viewer alive."""
         self._running = True
@@ -239,6 +339,7 @@ class GaussianViewer:
         except KeyboardInterrupt:
             print("\nViewer stopped.")
         finally:
+            self._write_benchmark()
             self.pipeline.close()
             # viser's websocket thread + thread executor have a teardown race
             # during interpreter shutdown that produces a noisy traceback

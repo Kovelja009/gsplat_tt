@@ -48,10 +48,22 @@ Then open <http://localhost:8080>. Drag to orbit, **WASD / QE / arrows** to fly.
 | Flag | Default | What |
 |---|---|---|
 | `--backend {cpu,tt}` | `cpu` | Rasterizer (see table above). |
-| `--max-resolution N` | `640`  | Cap on the longest render dim. Snapped to a multiple of 32. |
-| `--adaptive-resolution` | off | Drop to lower res while moving the camera (smoother drag). |
+| `--max-resolution N` | `640`  | Shorter render dim (480p/720p/1080p convention). Longer dim follows from browser aspect; both snap to multiples of 32. |
 | `--port N` | `8080` | Viewer port. |
 | `-v` / `--verbose` | off | Per-frame stage timing. |
+
+## Benchmarks
+
+Each viewer session writes a markdown summary to `benchmarks/` on shutdown
+(Ctrl+C). Filename is `{scene}_{backend}_{max-resolution}_{timestamp}.md`;
+the directory is created on demand and gitignored. Empty frames (no
+visible Gaussians) are excluded from the aggregate.
+
+The report records date, backend, scene, Gaussian count, the actual
+modal `W×H`, and the per-stage **median** across all sampled frames —
+plus the median total and the FPS implied by it. Each backend's
+`blend(...)` may also report sub-timings (e.g. `blend.device_kernel`),
+which are nested under the parent stage in the table.
 
 ## Setup details
 

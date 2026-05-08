@@ -87,7 +87,10 @@ return image, {"prep": 3.5, "kernel": 70.0, "readback": 0.3}
 ```
 
 These show up in `RenderResult.sub_timings` prefixed with `blend.`
-(e.g. `blend.kernel`).
+(e.g. `blend.kernel`). Dotted keys are treated as nesting in the
+benchmark markdown — e.g. returning `{"upload": ..., "kernel": ...,
+"kernel.device": ...}` renders `kernel.device` indented under `kernel`,
+which is the convention for "this is a sub-measurement of that one".
 
 **Async-backend caveat:** if your backend dispatches asynchronously
 (CUDA streams, etc.), synchronize before returning from `blend(...)` so
@@ -102,5 +105,7 @@ kernel-launch time. The TT backend is naturally synchronous because
 - **`tt/`** — Tenstorrent Wormhole / tt-metal. Spawns a long-lived
   daemon process; per-frame data goes through stdin/stdout + .npy files.
   Vendored tt-metal SDK lives in `tt/tt-metal/`. Reports
-  `blend.{prep,save_npy,daemon_rt,load_npy,device_kernel}` sub-timings.
+  `blend.{prep, save_npy, daemon_rt, daemon_rt.device_kernel, load_npy}`
+  sub-timings — the dotted key nests `device_kernel` under `daemon_rt` in
+  the benchmark table, since it's the on-device portion of the round-trip.
 - **`cuda/`** — placeholder for an upcoming CUDA implementation.

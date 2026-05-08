@@ -132,7 +132,7 @@ gsplat scenes/luigi.ply
 source venv/bin/activate
 export TT_METAL_HOME=$PWD/backends/tt/tt-metal
 export TT_METAL_RUNTIME_ROOT=$PWD/backends/tt/tt-metal
-gsplat scenes/bonsai_room.ply --backend tt --max-resolution 960 --adaptive-resolution
+gsplat scenes/bonsai_room.ply --backend tt --max-resolution 960
 ```
 
 `gsplat` is registered as a console_script in `pyproject.toml`. Equivalent:

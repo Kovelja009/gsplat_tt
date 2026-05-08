@@ -243,6 +243,9 @@ docs/thesis_plan.md
 # pip install -e . creates this metadata dir at the repo root; not for git.
 /gsplat_tt.egg-info/
 
+# Per-run benchmark markdowns written by the viewer on shutdown.
+/benchmarks/
+
 # IDE / editor settings — uncomment to also ignore .idea/ if you don't use JetBrains
 .vscode/
 

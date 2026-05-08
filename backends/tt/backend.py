@@ -140,14 +140,17 @@ class KernelBackend(Backend):
         image = np.load(f"{td}/out.npy")
         load_ms = (time.perf_counter() - t_load) * 1000.0
 
+        # Order matches the chronological flow; device_kernel uses a dotted
+        # key so the renderer can nest it visually under its parent (it's a
+        # sub-measurement of daemon_rt, not a sibling).
         sub_timings: dict[str, float] = {
             "prep": prep_ms,
             "save_npy": save_ms,
             "daemon_rt": rt_ms,
-            "load_npy": load_ms,
         }
         if kernel_ms is not None:
-            sub_timings["device_kernel"] = kernel_ms
+            sub_timings["daemon_rt.device_kernel"] = kernel_ms
+        sub_timings["load_npy"] = load_ms
 
         return image, sub_timings
 

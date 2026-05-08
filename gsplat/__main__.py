@@ -30,19 +30,10 @@ def main():
         type=int,
         default=640,
         help=(
-            "Cap longest dim of the render (preserving aspect ratio, rounded "
-            "down to multiple of 32). Prevents the kernel backend from "
-            "spending seconds in prepare_kernel_inputs at typical browser "
-            "resolutions. Default: 640."
-        ),
-    )
-    parser.add_argument(
-        "--adaptive-resolution",
-        action="store_true",
-        help=(
-            "Enable nerfview's adaptive low-res preview during camera movement "
-            "(smoother drag at the cost of pixelated frames). Default: off, "
-            "every frame is rendered at max-resolution."
+            "Shorter render dim, in pixels (480p/720p/1080p convention). The "
+            "longer dim follows from the browser's aspect ratio; both dims are "
+            "snapped down to multiples of 32 so the kernel sees whole tiles. "
+            "Default: 640."
         ),
     )
     parser.add_argument(
@@ -62,8 +53,8 @@ def main():
         port=args.port,
         backend=args.backend,
         max_resolution=args.max_resolution,
-        adaptive_resolution=args.adaptive_resolution,
         verbose=args.verbose,
+        scene_path=args.ply_path,
     )
     viewer.run()
 

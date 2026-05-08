@@ -7,15 +7,10 @@ import torch
 import viser
 import nerfview
 
+from backends import get_backend
 from gsplat.data_structures import Gaussians
+from gsplat.pipeline import Pipeline, RenderResult, format_timings
 from gsplat.utils import c2w_to_w2c
-from gsplat.rasterization import (
-    project_gaussians,
-    get_tile_assignments,
-    sort_and_bin,
-    alpha_blend,
-)
-from backends.tt.backend import KernelBackend
 
 
 # Tile size matches the kernel (32x32) for both backends so CPU and
@@ -26,8 +21,11 @@ TILE_SIZE = 32
 class GaussianViewer:
     """Interactive viewer for 3D Gaussian Splatting scenes.
 
-    Wraps nerfview/viser to display frames rendered by the CPU rasterizer
-    or the tt-metal v1c kernel daemon, with orbit camera controls in a browser.
+    Wraps nerfview/viser around a `gsplat.pipeline.Pipeline`. The pipeline
+    owns the chosen backend and produces a `RenderResult` for every frame,
+    including per-stage timings — so adding a new backend (CUDA, ...)
+    requires no changes here as long as it's registered in
+    `backends/REGISTRY`.
     """
 
     def __init__(
@@ -41,7 +39,7 @@ class GaussianViewer:
         verbose: bool = False,
     ):
         self.gaussians = gaussians
-        self.backend = backend  # "cpu" or "tt"
+        self.backend_name = backend
         # Cap longest output dim. Browser tabs ask for arbitrary sizes (often
         # 1920x1080); without a cap, prepare_kernel_inputs takes seconds and
         # the viewer feels frozen. Stretching the displayed image is fine for
@@ -53,10 +51,11 @@ class GaussianViewer:
         # requests during camera movement (smoother drag, pixelated previews).
         self.adaptive_resolution = adaptive_resolution
         self.verbose = verbose
-        if backend == "tt":
-            self._kernel = KernelBackend(verbose=verbose)
-        else:
-            self._kernel = None
+
+        # Spin up the backend lazily through the registry, then wrap it in a
+        # Pipeline so per-stage timing happens automatically.
+        self.pipeline = Pipeline(get_backend(backend, verbose=verbose),
+                                 tile_size=TILE_SIZE)
 
         # Compute scene bounds for initial camera placement.
         # Naive mean / min-max over ALL Gaussians is fragile: trained 3DGS
@@ -168,7 +167,7 @@ class GaussianViewer:
         render_tab_state: nerfview.RenderTabState,
     ) -> np.ndarray:
         """Render callback invoked by nerfview for each frame."""
-        start = time.perf_counter()
+        wall_start = time.perf_counter()
         if self.verbose:
             print(
                 f"[render-enter] preview={render_tab_state.preview_render} "
@@ -184,77 +183,42 @@ class GaussianViewer:
         extrinsics = c2w_to_w2c(camera_state.c2w)
         intrinsics = torch.tensor(camera_state.get_K((W, H)), dtype=torch.float32)
 
-        g = self.gaussians
+        # One pipeline call covers project → tile_assign → sort → blend.
+        # `result.timings` already has per-stage wall-clock; the backend may
+        # also have populated `result.sub_timings` (e.g. blend.kernel_run).
+        result = self.pipeline.render(self.gaussians, extrinsics, intrinsics, H, W)
 
-        t_proj = time.perf_counter()
-        means_2d, covs_2d, depths, radii, valid_mask = project_gaussians(
-            g.means, g.scales, g.rotations, extrinsics, intrinsics, H, W,
-            opacities=g.opacities,
-        )
-        proj_ms = (time.perf_counter() - t_proj) * 1000.0
-
-        num_visible = int(valid_mask.sum().item())
-
-        if num_visible == 0:
-            elapsed = time.perf_counter() - start
-            if self.verbose:
-                print(
-                    f"[render] req={req_W}x{req_H} -> {W}x{H}  "
-                    f"sorted=0  visible=0 (early exit)  "
-                    f"total={elapsed*1000:.0f}ms  backend={self.backend}",
-                    flush=True,
-                )
-            self._update_stats(elapsed, W, H, 0)
-            return np.zeros((H, W, 3), dtype=np.uint8)
-
-        colors = g.colors[valid_mask]
-        opacities = g.opacities[valid_mask]
-
-        t_assign = time.perf_counter()
-        gaussian_ids, tile_ids, _ = get_tile_assignments(
-            means_2d, radii, H, W, tile_size=TILE_SIZE,
-        )
-        tiles_x = (W + TILE_SIZE - 1) // TILE_SIZE
-        tiles_y = (H + TILE_SIZE - 1) // TILE_SIZE
-        sorted_gaussian_ids, tile_ranges = sort_and_bin(
-            gaussian_ids, tile_ids, depths, tiles_x, tiles_y,
-        )
-        assign_ms = (time.perf_counter() - t_assign) * 1000.0
-        if self.verbose:
-            print(
-                f"[render-mid] visible={num_visible}  tiles={tiles_x*tiles_y}  "
-                f"sorted={len(sorted_gaussian_ids)}  "
-                f"proj={proj_ms:.0f}ms  assign={assign_ms:.0f}ms",
-                flush=True,
-            )
-
-        t_blend = time.perf_counter()
-        if self.backend == "tt":
-            image_np = self._kernel.render(
-                means_2d, covs_2d, colors, opacities,
-                sorted_gaussian_ids, tile_ranges, H, W,
-            )
-            image = torch.from_numpy(image_np)
+        # Convert pipeline output → uint8 image for nerfview/viser.
+        if result.image is None:
+            image_np = np.zeros((H, W, 3), dtype=np.uint8)
         else:
-            image = alpha_blend(
-                means_2d, covs_2d, colors, opacities,
-                sorted_gaussian_ids, tile_ranges, H, W, tile_size=TILE_SIZE,
-            )
-        blend_ms = (time.perf_counter() - t_blend) * 1000.0
+            image_np = (np.clip(result.image, 0.0, 1.0) * 255).astype(np.uint8)
 
-        image_np = (image.clamp(0.0, 1.0).numpy() * 255).astype(np.uint8)
-
-        elapsed = time.perf_counter() - start
+        wall_elapsed = time.perf_counter() - wall_start
         if self.verbose:
-            print(
-                f"[render] req={req_W}x{req_H} -> {W}x{H}  "
-                f"sorted={len(sorted_gaussian_ids)}  "
-                f"blend={blend_ms:.0f}ms  total={elapsed*1000:.0f}ms  "
-                f"backend={self.backend}",
-                flush=True,
-            )
-        self._update_stats(elapsed, W, H, num_visible)
+            self._log_verbose(req_W, req_H, W, H, result, wall_elapsed)
+        self._update_stats(wall_elapsed, W, H, result.num_visible)
         return image_np
+
+    def _log_verbose(
+        self,
+        req_W: int,
+        req_H: int,
+        W: int,
+        H: int,
+        result: RenderResult,
+        wall_elapsed: float,
+    ) -> None:
+        print(
+            f"[render] req={req_W}x{req_H} -> {W}x{H}  "
+            f"visible={result.num_visible}  sorted={result.num_entries}  "
+            f"backend={self.backend_name}",
+            flush=True,
+        )
+        print(format_timings(result), flush=True)
+        # Wall-clock is total inside _render_fn (incl. resize-resolve etc.);
+        # log alongside the pipeline-internal total for sanity checking.
+        print(f"[wall]  {wall_elapsed * 1000:6.1f} ms", flush=True)
 
     def _update_stats(
         self, elapsed: float, width: int, height: int, num_visible: int,
@@ -275,8 +239,7 @@ class GaussianViewer:
         except KeyboardInterrupt:
             print("\nViewer stopped.")
         finally:
-            if self._kernel is not None:
-                self._kernel.close()
+            self.pipeline.close()
             # viser's websocket thread + thread executor have a teardown race
             # during interpreter shutdown that produces a noisy traceback
             # ("cannot schedule new futures after shutdown"). Hard-exit after

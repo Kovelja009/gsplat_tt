@@ -2,10 +2,16 @@
 
 The daemon (`metal_example_gaussian_splatting --daemon`) opens the Wormhole
 device once, JIT-compiles the three kernels, and then loops reading FRAME
-requests on stdin. This module spawns it, sends one FRAME per render call,
-and reads back the OK/ERR response — keeping the ~3 s init cost off the
-per-frame path so interactive use is feasible.
+requests on stdin. This module spawns it, sends one FRAME per `blend(...)`
+call, and reads back the OK/ERR response — keeping the ~3 s init cost off
+the per-frame path so interactive use is feasible.
+
+Implements the `gsplat.backend.Backend` contract: only `blend(...)` is
+overridden — projection / tile-assignment / sort run on CPU via the
+default implementations inherited from the base class.
 """
+from __future__ import annotations
+
 import os
 import subprocess
 import tempfile
@@ -14,16 +20,17 @@ import time
 import numpy as np
 import torch
 
+from gsplat.backend import Backend
 from gsplat.rasterization import prepare_kernel_inputs
 
 
-class KernelBackend:
+class KernelBackend(Backend):
     """Persistent IPC wrapper around the alpha-blend daemon subprocess.
 
-    Spawn once at viewer/script start, call `render(...)` per frame,
-    and `close()` on shutdown. The daemon's READY-then-FRAME-then-OK
-    protocol is line-oriented over stdin/stdout with .npy files for
-    payload data; non-protocol log lines on stdout are skipped.
+    Spawn once at viewer/script start, call `blend(...)` per frame,
+    `close()` on shutdown. The daemon's READY-then-FRAME-then-OK protocol
+    is line-oriented over stdin/stdout with .npy files for payload data;
+    non-protocol log lines on stdout are skipped.
     """
 
     BINARY_PATH = "backends/tt/tt-metal/build/programming_examples/metal_example_gaussian_splatting"
@@ -58,39 +65,42 @@ class KernelBackend:
             raise RuntimeError(f"daemon failed to start: last line {line!r}")
         self._tmpdir = tempfile.mkdtemp(prefix="gsplat_viewer_")
 
-    def render(
+    # ------------------------------------------------------------------
+    # Backend API
+    # ------------------------------------------------------------------
+
+    def blend(
         self,
         means_2d: torch.Tensor,
         covs_2d: torch.Tensor,
         colors: torch.Tensor,
         opacities: torch.Tensor,
-        sorted_gids: torch.Tensor,
+        sorted_gaussian_ids: torch.Tensor,
         tile_ranges: torch.Tensor,
-        H: int,
-        W: int,
-    ) -> np.ndarray:
-        t0 = time.perf_counter()
-        packs, offsets, px, py = prepare_kernel_inputs(
-            means_2d, covs_2d, colors, opacities, sorted_gids, tile_ranges, H, W,
-        )
-        prep_ms = (time.perf_counter() - t0) * 1000.0
+        image_height: int,
+        image_width: int,
+    ) -> tuple[np.ndarray, dict[str, float]]:
+        H, W = image_height, image_width
 
-        t1 = time.perf_counter()
+        # Sub-stage A: SoA repack (kernel-friendly layout).
+        t_prep = time.perf_counter()
+        packs, offsets, px, py = prepare_kernel_inputs(
+            means_2d, covs_2d, colors, opacities,
+            sorted_gaussian_ids, tile_ranges, H, W,
+        )
+        prep_ms = (time.perf_counter() - t_prep) * 1000.0
+
+        # Sub-stage B: serialize SoA buffers as .npy for the daemon.
+        t_save = time.perf_counter()
         td = self._tmpdir
         np.save(f"{td}/packs.npy", packs)
         np.save(f"{td}/offsets.npy", offsets.astype(np.float32))
         np.save(f"{td}/px.npy", px)
         np.save(f"{td}/py.npy", py)
-        save_ms = (time.perf_counter() - t1) * 1000.0
+        save_ms = (time.perf_counter() - t_save) * 1000.0
 
-        if self.verbose:
-            print(
-                f"[kernel-pre] prep={prep_ms:.0f}ms  save={save_ms:.0f}ms  "
-                f"packs.shape={packs.shape}",
-                flush=True,
-            )
-
-        t2 = time.perf_counter()
+        # Sub-stage C: daemon round-trip (DRAM upload + kernel + readback).
+        t_rt = time.perf_counter()
         line = (
             f"FRAME {H} {W} "
             f"{td}/packs.npy {td}/offsets.npy {td}/px.npy {td}/py.npy {td}/out.npy\n"
@@ -114,17 +124,36 @@ class KernelBackend:
             raise RuntimeError("daemon timeout waiting for OK/ERR")
         if not resp.startswith("OK "):
             raise RuntimeError(f"daemon error: {resp!r}")
+        rt_ms = (time.perf_counter() - t_rt) * 1000.0
 
-        if self.verbose:
-            rt_ms = (time.perf_counter() - t2) * 1000.0
-            print(f"[kernel-post] daemon-roundtrip={rt_ms:.0f}ms  resp={resp!r}", flush=True)
+        # Parse the daemon's reported device-side kernel time from "OK <ms>".
+        # Surface as a sub-timing so callers can separate dispatch+IO from
+        # actual on-device kernel runtime.
+        kernel_ms = None
+        try:
+            kernel_ms = float(resp.split(maxsplit=1)[1])
+        except (IndexError, ValueError):
+            pass
 
-        # Binary already crops to (H, W, 3) on its side.
-        return np.load(f"{td}/out.npy")
+        # Sub-stage D: load the rendered image from the daemon's .npy.
+        t_load = time.perf_counter()
+        image = np.load(f"{td}/out.npy")
+        load_ms = (time.perf_counter() - t_load) * 1000.0
 
-    def close(self):
+        sub_timings: dict[str, float] = {
+            "prep": prep_ms,
+            "save_npy": save_ms,
+            "daemon_rt": rt_ms,
+            "load_npy": load_ms,
+        }
+        if kernel_ms is not None:
+            sub_timings["device_kernel"] = kernel_ms
+
+        return image, sub_timings
+
+    def close(self) -> None:
         # Don't rmtree tmpdir here — nerfview's render thread may still be
-        # mid-flight in render(), and pulling the directory out from under it
+        # mid-flight in blend(), and pulling the directory out from under it
         # produces a confusing FileNotFoundError on Ctrl+C. /tmp is cleaned by
         # the OS on reboot; leaving the dir is harmless.
         #

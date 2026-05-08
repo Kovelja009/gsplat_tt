@@ -1,5 +1,6 @@
 import argparse
 
+from backends import REGISTRY as BACKEND_REGISTRY
 from gsplat.loading_gaussians import load_ply
 from gsplat.viewer import GaussianViewer
 
@@ -17,9 +18,12 @@ def main():
     )
     parser.add_argument(
         "--backend",
-        choices=["cpu", "tt"],
+        choices=sorted(BACKEND_REGISTRY),
         default="cpu",
-        help="Rendering backend: cpu (PyTorch reference) or tt (Tenstorrent kernel). Default: cpu.",
+        help=(
+            "Rendering backend; choices come from the registry in "
+            "backends/__init__.py. Default: cpu."
+        ),
     )
     parser.add_argument(
         "--max-resolution",

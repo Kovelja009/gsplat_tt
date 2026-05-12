@@ -65,4 +65,38 @@ class CudaBackend(Backend):
         image_height: int,
         image_width: int,
     ) -> tuple[np.ndarray, dict[str, float]]:
-        raise NotImplementedError("blend implemented in Task 4")
+        if self._ext is None:
+            from backends.cuda.kernels.build import _load_extension
+            self._ext = _load_extension()
+
+        sub: dict[str, float] = {}
+
+        # ---- Stage A: H2D upload + SoA repack ----
+        t = time.perf_counter()
+        d_means  = means_2d.to(self._device, dtype=torch.float32, non_blocking=True)
+        d_conics = _pack_conics(covs_2d).to(self._device, non_blocking=True)
+        d_rgba   = _pack_rgba(colors, opacities).to(self._device, non_blocking=True)
+        d_ids    = sorted_gaussian_ids.to(self._device, dtype=torch.int32, non_blocking=True)
+        d_ranges = tile_ranges.to(self._device, dtype=torch.int32, non_blocking=True)
+        sub["upload"] = (time.perf_counter() - t) * 1000.0
+
+        # ---- Stage B: kernel launch + D2H readback ----
+        ev_s = torch.cuda.Event(enable_timing=True)
+        ev_e = torch.cuda.Event(enable_timing=True)
+        t = time.perf_counter()
+        ev_s.record()
+        d_out = self._ext.alpha_blend(
+            d_means, d_conics, d_rgba, d_ids, d_ranges,
+            image_height, image_width,
+        )
+        ev_e.record()
+        image = d_out.cpu().numpy()  # implicit sync via D2H memcpy
+        sub["kernel"]        = (time.perf_counter() - t) * 1000.0
+        sub["kernel.device"] = ev_s.elapsed_time(ev_e)
+
+        return image, sub
+
+    def close(self) -> None:
+        # Nothing to release: the JIT-loaded extension lives in the
+        # torch_extensions cache and tensors are freed by GC.
+        pass

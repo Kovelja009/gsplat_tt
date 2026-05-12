@@ -127,3 +127,77 @@ def test_cuda_psnr_64(cuda_backend):
         assert ssim_val >= 0.98, f"SSIM too low: {ssim_val:.4f}"
     except ImportError:
         print("scikit-image not installed; skipping SSIM check")
+
+
+@cuda_only
+def test_cuda_640_perf(cuda_backend):
+    """640x640 / 10K-Gaussian perf — prints wall-vs-device ms, loose ceiling.
+
+    Counterpart to test_640_perf_baseline in test_kernel_integration.py.
+    Soft assertion only — fail if kernel.device exceeds 200 ms (any
+    consumer NVIDIA GPU from the last 5 years should clear this easily).
+    """
+    from gsplat.rasterization import (
+        project_gaussians, get_tile_assignments, sort_and_bin, alpha_blend,
+    )
+
+    torch.manual_seed(42)
+    H, W = 640, 640
+    N = 10_000
+    means = torch.rand(N, 3) * torch.tensor([2.0, 2.0, 2.0]) + torch.tensor([-1.0, -1.0, 1.0])
+    scales = torch.rand(N, 3) * 0.1 + 0.02
+    q = torch.randn(N, 4); q = q / q.norm(dim=-1, keepdim=True)
+    colors = torch.rand(N, 3)
+    opacities = torch.rand(N) * 0.5 + 0.2
+
+    extrinsics = torch.eye(4)
+    fx = fy = 400.0
+    intrinsics = torch.tensor(
+        [[fx, 0, W / 2], [0, fy, H / 2], [0, 0, 1]], dtype=torch.float32
+    )
+
+    means_2d, covs_2d, depths, radii, valid = project_gaussians(
+        means, scales, q, extrinsics, intrinsics, H, W,
+    )
+    colors_v = colors[valid]
+    opacities_v = opacities[valid]
+    gids, tids, _ = get_tile_assignments(means_2d, radii, H, W, tile_size=32)
+    tiles_x = (W + 31) // 32
+    tiles_y = (H + 31) // 32
+    sorted_gids, tile_ranges = sort_and_bin(gids, tids, depths, tiles_x, tiles_y)
+
+    # Warm up to amortise per-call cuBLAS / context init.
+    _ = cuda_backend.blend(
+        means_2d, covs_2d, colors_v, opacities_v,
+        sorted_gids, tile_ranges, H, W,
+    )
+
+    t0 = time.perf_counter()
+    cuda_img, sub = cuda_backend.blend(
+        means_2d, covs_2d, colors_v, opacities_v,
+        sorted_gids, tile_ranges, H, W,
+    )
+    wall = (time.perf_counter() - t0) * 1000.0
+
+    # Diagnostic: also run the CPU reference for a sanity PSNR.
+    cpu_img = alpha_blend(
+        means_2d, covs_2d, colors_v, opacities_v,
+        sorted_gids, tile_ranges, H, W, tile_size=32,
+    ).numpy()
+    psnr = _psnr(cpu_img, cuda_img)
+
+    print()
+    print("===== CUDA 640x640 perf =====")
+    print(f"Scene: H={H} W={W}, N={N} input, {int(valid.sum()):,} visible")
+    print(f"Sorted entries: {sorted_gids.numel():,}  Total tiles: {tiles_x * tiles_y}")
+    print(f"Wall  (Python perf_counter):        {wall:>7.2f} ms")
+    print(f"Upload:                             {sub['upload']:>7.2f} ms")
+    print(f"Kernel (host wall + sync via D2H):  {sub['kernel']:>7.2f} ms")
+    print(f"Kernel.device (CUDA event):         {sub['kernel.device']:>7.2f} ms")
+    print(f"PSNR vs CPU: {psnr:.2f} dB")
+
+    # Loose ceiling to catch regressions, not a fixed target.
+    assert sub["kernel.device"] < 200.0, (
+        f"kernel.device too slow: {sub['kernel.device']:.1f} ms"
+    )
+    assert psnr >= 35.0, f"PSNR regressed: {psnr:.2f} dB"

@@ -92,12 +92,11 @@ __global__ void alpha_blend_kernel(
                 if (T < T_EPS) { done = true; break; }
             }
         }
-        __syncthreads();
-
-        // Warp-wide early-out: if the whole warp has saturated, skip
-        // remaining batches. (Whole-block early-out would need
-        // __syncthreads_and; warp granularity is the cheap win.)
-        if (__all_sync(0xffffffffu, done)) break;
+        // Whole-block early-out: cooperatively vote — if every thread
+        // in the block has saturated, no warp needs to load further
+        // batches. __syncthreads_and acts as both the post-loop barrier
+        // and the AND-reduction across all threads.
+        if (__syncthreads_and(done)) break;
     }
 
     if (inside_image) {

@@ -196,8 +196,11 @@ def test_cuda_640_perf(cuda_backend):
     print(f"Kernel.device (CUDA event):         {sub['kernel.device']:>7.2f} ms")
     print(f"PSNR vs CPU: {psnr:.2f} dB")
 
-    # Loose ceiling to catch regressions, not a fixed target.
-    assert sub["kernel.device"] < 200.0, (
-        f"kernel.device too slow: {sub['kernel.device']:.1f} ms"
+    # Regression gate: this scene runs at ~0.65 ms on RTX 4060. A 5 ms
+    # ceiling is ~8x slack to absorb GPU/driver variation while still
+    # catching real regressions (the original 200 ms was a "does it run
+    # at all" gate).
+    assert sub["kernel.device"] < 5.0, (
+        f"kernel.device too slow: {sub['kernel.device']:.1f} ms (>5 ms regression gate)"
     )
     assert psnr >= 35.0, f"PSNR regressed: {psnr:.2f} dB"

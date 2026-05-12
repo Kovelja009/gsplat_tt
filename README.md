@@ -15,7 +15,7 @@ The same viewer can dispatch to multiple rasterizers:
 |---|---|---|
 | `cpu`  | shipping | Pure PyTorch reference. Slow (~1–2 s/frame at 256×256), used as the correctness baseline. |
 | `tt`   | shipping | tt-metal kernels on a Tenstorrent Wormhole device. ~80 ms/frame at 640×640 (21.7× CPU). |
-| `cuda` | planned  | Placeholder; same wrapper interface, CUDA implementation TBD. |
+| `cuda` | experimental | JIT-compiles on first use via `torch.utils.cpp_extension`. Requires a CUDA-capable GPU and `requirements-cuda.txt` installed. |
 
 Pipeline (CPU does setup, the chosen backend does the alpha-blend):
 
@@ -39,15 +39,31 @@ source venv/bin/activate
 export TT_METAL_HOME=$PWD/backends/tt/tt-metal
 export TT_METAL_RUNTIME_ROOT=$PWD/backends/tt/tt-metal
 gsplat scenes/luigi.ply --backend tt
+
+# 4) CUDA viewer (NVIDIA GPU required; first run JIT-compiles the kernel)
+source venv/bin/activate
+pip install -r requirements-cuda.txt   # one-time: swap cpu torch wheel for cu121, install ninja
+gsplat scenes/luigi.ply --backend cuda
 ```
 
 Then open <http://localhost:8080>. Drag to orbit, **WASD / QE / arrows** to fly.
+
+For the CUDA backend on a CUDA-capable host, after `./setup.sh`:
+
+```bash
+source venv/bin/activate
+pip install -r requirements-cuda.txt
+```
+
+This swaps the CPU torch wheel for the cu121 build in place and installs
+`ninja` (used by the JIT compiler). The TT dev box can skip this — `cuda`
+will simply not appear in the backend registry.
 
 ## CLI flags
 
 | Flag | Default | What |
 |---|---|---|
-| `--backend {cpu,tt}` | `cpu` | Rasterizer (see table above). |
+| `--backend {cpu,tt,cuda}` | `cpu` | Rasterizer (see table above). |
 | `--max-resolution N` | `640`  | Shorter render dim (480p/720p/1080p convention). Longer dim follows from browser aspect; both snap to multiples of 32. |
 | `--port N` | `8080` | Viewer port. |
 | `-v` / `--verbose` | off | Per-frame stage timing. |
@@ -106,7 +122,7 @@ gsplat_tt/
     │   ├── backend.py         # daemon-subprocess wrapper
     │   └── tt-metal/          # vendored SDK + our kernels under
     │       └── tt_metal/programming_examples/gaussian_splatting/
-    └── cuda/                  # placeholder for the future
+    └── cuda/                  # CUDA backend (kernels JIT-compiled on first use)
 ```
 
 ## Performance

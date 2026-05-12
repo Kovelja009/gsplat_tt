@@ -1,7 +1,14 @@
-# CUDA backend (planned)
+# CUDA backend
 
-Placeholder — implementation pending. See `../README.md` for the wrapper
-interface this backend needs to expose.
+NVIDIA GPU alpha-blend via a custom CUDA kernel. Compiled JIT on first
+`CudaBackend()` instantiation through `torch.utils.cpp_extension.load`
+(~30-60s on a clean cache; cached under `~/.cache/torch_extensions/`).
+
+Sources live in `kernels/`:
+- `alpha_blend.cu` — `__global__` kernel + host-side entry function
+- `alpha_blend.h` — entry-function declaration
+- `pybind.cpp` — `PYBIND11_MODULE` wrapper
+- `build.py` — memoised `torch.utils.cpp_extension.load` loader
 
 ## Timing
 

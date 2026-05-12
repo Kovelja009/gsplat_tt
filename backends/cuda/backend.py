@@ -42,30 +42,17 @@ def _pack_rgba(colors: torch.Tensor, opacities: torch.Tensor) -> torch.Tensor:
 
 
 class CudaBackend(Backend):
-    """Alpha-blend backend running on an NVIDIA GPU via a custom kernel.
+    """Alpha-blend backend running on an NVIDIA GPU via a custom kernel."""
 
-    `dtype` selects the on-device storage precision for Gaussian
-    attributes (means / conics / rgba):
-      "fp32" — full fp32 everywhere (max precision; PSNR ~158 dB vs CPU).
-      "bf16" — bfloat16 storage + fp32 in-register compute and accumulate.
-               Halves shared-mem and global-mem footprint per Gaussian.
-               Matches the TT kernel's mixed-precision design. PSNR drop
-               is small (still well above the 35 dB gate).
-    """
-
-    def __init__(self, verbose: bool = False, dtype: str = "fp32"):
+    def __init__(self, verbose: bool = False):
         if not torch.cuda.is_available():
             raise RuntimeError(
                 "CudaBackend requires a CUDA-capable device; "
                 "torch.cuda.is_available() returned False"
             )
-        if dtype not in ("fp32", "bf16"):
-            raise ValueError(f"CudaBackend dtype must be 'fp32' or 'bf16'; got {dtype!r}")
         self.verbose = verbose
-        self.dtype = dtype
-        self._torch_dtype = torch.float32 if dtype == "fp32" else torch.bfloat16
         self._device = torch.device("cuda")
-        self._ext = None
+        self._ext = None  # populated in Task 4
 
     def blend(
         self,
@@ -83,25 +70,22 @@ class CudaBackend(Backend):
             self._ext = _load_extension()
 
         sub: dict[str, float] = {}
-        dt = self._torch_dtype
 
         # ---- Stage A: H2D upload + SoA repack ----
         t = time.perf_counter()
-        d_means  = means_2d.to(self._device, dtype=dt, non_blocking=True)
-        d_conics = _pack_conics(covs_2d).to(self._device, dtype=dt, non_blocking=True)
-        d_rgba   = _pack_rgba(colors, opacities).to(self._device, dtype=dt, non_blocking=True)
+        d_means  = means_2d.to(self._device, dtype=torch.float32, non_blocking=True)
+        d_conics = _pack_conics(covs_2d).to(self._device, non_blocking=True)
+        d_rgba   = _pack_rgba(colors, opacities).to(self._device, non_blocking=True)
         d_ids    = sorted_gaussian_ids.to(self._device, dtype=torch.int32, non_blocking=True)
         d_ranges = tile_ranges.to(self._device, dtype=torch.int32, non_blocking=True)
         sub["upload"] = (time.perf_counter() - t) * 1000.0
 
         # ---- Stage B: kernel launch + D2H readback ----
-        kernel_fn = (self._ext.alpha_blend if self.dtype == "fp32"
-                     else self._ext.alpha_blend_bf16)
         ev_s = torch.cuda.Event(enable_timing=True)
         ev_e = torch.cuda.Event(enable_timing=True)
         t = time.perf_counter()
         ev_s.record()
-        d_out = kernel_fn(
+        d_out = self._ext.alpha_blend(
             d_means, d_conics, d_rgba, d_ids, d_ranges,
             image_height, image_width,
         )

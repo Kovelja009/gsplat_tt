@@ -24,13 +24,6 @@ def cuda_backend():
     return CudaBackend()
 
 
-@pytest.fixture(scope="module")
-def cuda_backend_bf16():
-    """bf16-storage variant — matches the TT kernel's mixed-precision design."""
-    from backends.cuda.backend import CudaBackend
-    return CudaBackend(dtype="bf16")
-
-
 @cuda_only
 def test_cuda_backend_smoke_shape(cuda_backend):
     """blend(...) returns an (H, W, 3) float32 numpy array and the right keys."""
@@ -211,57 +204,3 @@ def test_cuda_640_perf(cuda_backend):
         f"kernel.device too slow: {sub['kernel.device']:.1f} ms (>5 ms regression gate)"
     )
     assert psnr >= 35.0, f"PSNR regressed: {psnr:.2f} dB"
-
-
-@cuda_only
-def test_cuda_bf16_psnr_64(cuda_backend_bf16):
-    """bf16 path: PSNR vs CPU reference still clears the 35 dB gate.
-
-    Expected ~50-55 dB on real scenes (matches the TT kernel which uses
-    the same bf16-storage + fp32-accumulate design). The 100+ dB seen
-    on the fp32 path drops because bf16 has 7 mantissa bits vs fp32's 23.
-    """
-    from gsplat.rasterization import (
-        project_gaussians, get_tile_assignments, sort_and_bin, alpha_blend,
-    )
-
-    torch.manual_seed(42)
-    H, W = 64, 64
-    N = 50
-    means = torch.rand(N, 3) * torch.tensor([2.0, 2.0, 0.0]) + torch.tensor([-1.0, -1.0, 1.0])
-    scales = torch.rand(N, 3) * 0.1 + 0.02
-    q = torch.randn(N, 4); q = q / q.norm(dim=-1, keepdim=True)
-    colors = torch.rand(N, 3)
-    opacities = torch.rand(N) * 0.5 + 0.2
-
-    extrinsics = torch.eye(4)
-    fx = fy = 40.0
-    intrinsics = torch.tensor(
-        [[fx, 0, W / 2], [0, fy, H / 2], [0, 0, 1]], dtype=torch.float32
-    )
-
-    means_2d, covs_2d, depths, radii, valid = project_gaussians(
-        means, scales, q, extrinsics, intrinsics, H, W,
-    )
-    if valid.sum().item() == 0:
-        pytest.skip("no visible Gaussians — reroll seed")
-    colors_v = colors[valid]
-    opacities_v = opacities[valid]
-    gids, tids, _ = get_tile_assignments(means_2d, radii, H, W, tile_size=32)
-    tiles_x = (W + 31) // 32
-    tiles_y = (H + 31) // 32
-    sorted_gids, tile_ranges = sort_and_bin(gids, tids, depths, tiles_x, tiles_y)
-
-    cpu_img = alpha_blend(
-        means_2d, covs_2d, colors_v, opacities_v,
-        sorted_gids, tile_ranges, H, W, tile_size=32,
-    ).numpy()
-    bf16_img, sub = cuda_backend_bf16.blend(
-        means_2d, covs_2d, colors_v, opacities_v,
-        sorted_gids, tile_ranges, H, W,
-    )
-
-    psnr = _psnr(cpu_img, bf16_img)
-    print(f"\nPSNR (CUDA-bf16 vs CPU): {psnr:.2f} dB")
-    print(f"sub-timings: {sub}")
-    assert psnr >= 35.0, f"bf16 PSNR too low: {psnr:.2f} dB (want >= 35)"

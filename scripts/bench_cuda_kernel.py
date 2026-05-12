@@ -42,36 +42,33 @@ def main(iters: int = 50, warmup: int = 5) -> None:
     tiles_y = (H + 31) // 32
     sorted_gids, tile_ranges = sort_and_bin(gids, tids, depths, tiles_x, tiles_y)
 
+    backend = CudaBackend()
     args = (means_2d, covs_2d, colors_v, opacities_v, sorted_gids, tile_ranges, H, W)
 
-    print(f"Scene: H={H} W={W}, N={N} input, {int(valid.sum()):,} visible, "
-          f"{sorted_gids.numel():,} sorted entries, {tiles_x * tiles_y} tiles")
-    print(f"iters={iters}, warmup={warmup}")
+    # Warm up
+    for _ in range(warmup):
+        backend.blend(*args)
+    torch.cuda.synchronize()
+
+    dev_times: list[float] = []
+    kern_times: list[float] = []
+    up_times: list[float] = []
+    for _ in range(iters):
+        _, sub = backend.blend(*args)
+        dev_times.append(sub["kernel.device"])
+        kern_times.append(sub["kernel"])
+        up_times.append(sub["upload"])
 
     def fmt(name: str, vals: list[float]) -> str:
         return (f"{name:>20s}: min={min(vals):>6.3f}  median={stats.median(vals):>6.3f}  "
                 f"p90={sorted(vals)[int(len(vals)*0.9)]:>6.3f}  ms")
 
-    for dtype in ("fp32", "bf16"):
-        backend = CudaBackend(dtype=dtype)
-        # Warm up (also triggers JIT compile + per-mode caches)
-        for _ in range(warmup):
-            backend.blend(*args)
-        torch.cuda.synchronize()
-
-        dev_times: list[float] = []
-        kern_times: list[float] = []
-        up_times: list[float] = []
-        for _ in range(iters):
-            _, sub = backend.blend(*args)
-            dev_times.append(sub["kernel.device"])
-            kern_times.append(sub["kernel"])
-            up_times.append(sub["upload"])
-
-        print(f"\n=== dtype={dtype} ===")
-        print(fmt("kernel.device", dev_times))
-        print(fmt("kernel (wall+D2H)", kern_times))
-        print(fmt("upload", up_times))
+    print(f"Scene: H={H} W={W}, N={N} input, {int(valid.sum()):,} visible, "
+          f"{sorted_gids.numel():,} sorted entries, {tiles_x * tiles_y} tiles")
+    print(f"iters={iters}, warmup={warmup}")
+    print(fmt("kernel.device", dev_times))
+    print(fmt("kernel (wall+D2H)", kern_times))
+    print(fmt("upload", up_times))
 
 
 if __name__ == "__main__":

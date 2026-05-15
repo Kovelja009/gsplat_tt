@@ -20,8 +20,17 @@ from backends.tt.backend import KernelBackend
 REGISTRY: dict[str, type[Backend]] = {
     "cpu": CpuBackend,
     "tt":  KernelBackend,
-    # "cuda": CudaBackend,   ← drop in when implemented
 }
+
+# CudaBackend is optional — register only if its module imports cleanly.
+# On a CPU-only box, the import itself is harmless (no top-level torch.cuda
+# access), but we keep the try/except so a future kernel-import failure
+# inside backends/cuda/* doesn't prevent the CPU/TT backends from loading.
+try:
+    from backends.cuda.backend import CudaBackend
+    REGISTRY["cuda"] = CudaBackend
+except ImportError:
+    pass
 
 
 def get_backend(name: str, **kwargs) -> Backend:

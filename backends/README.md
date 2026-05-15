@@ -108,4 +108,9 @@ kernel-launch time. The TT backend is naturally synchronous because
   `blend.{prep, save_npy, daemon_rt, daemon_rt.device_kernel, load_npy}`
   sub-timings — the dotted key nests `device_kernel` under `daemon_rt` in
   the benchmark table, since it's the on-device portion of the round-trip.
-- **`cuda/`** — placeholder for an upcoming CUDA implementation.
+- **`cuda/`** — NVIDIA GPU via a custom CUDA kernel JIT-compiled by
+  `torch.utils.cpp_extension`. Block-per-tile / thread-per-pixel
+  alpha-blend, sources in `cuda/kernels/`. Reports
+  `blend.{upload, kernel, kernel.device}` sub-timings — the dotted key
+  nests `kernel.device` (CUDA event elapsed time) under `kernel` (host
+  wall including dispatch + D2H sync).

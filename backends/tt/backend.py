@@ -35,7 +35,7 @@ class KernelBackend(Backend):
 
     BINARY_PATH = "backends/tt/tt-metal/build/programming_examples/metal_example_gaussian_splatting"
 
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, stage_dir: str | None = None):
         self.verbose = verbose
         env = os.environ.copy()
         env.setdefault("TT_METAL_HOME", os.path.abspath("backends/tt/tt-metal"))
@@ -63,7 +63,17 @@ class KernelBackend(Backend):
                 break
         if ready != "READY":
             raise RuntimeError(f"daemon failed to start: last line {line!r}")
-        self._tmpdir = tempfile.mkdtemp(prefix="gsplat_viewer_")
+        # Stage the per-frame .npy hand-off files on tmpfs (/dev/shm) when
+        # available so np.save / np.load are RAM memcpys rather than disk
+        # round-trips. The daemon reads these four files back every frame and
+        # writes out.npy, so on a disk-backed /tmp the
+        # serialize→read→kernel→write→deserialize cycle lands directly on the
+        # per-frame hot path. `stage_dir` overrides the location: None → auto
+        # (/dev/shm if it exists and is writable, else the default temp dir).
+        if stage_dir is None:
+            shm = "/dev/shm"
+            stage_dir = shm if os.path.isdir(shm) and os.access(shm, os.W_OK) else None
+        self._tmpdir = tempfile.mkdtemp(prefix="gsplat_viewer_", dir=stage_dir)
 
     # ------------------------------------------------------------------
     # Backend API

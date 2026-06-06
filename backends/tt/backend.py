@@ -87,6 +87,9 @@ class KernelBackend(Backend):
         # self._mm = None and blend() transparently uses the .npy FRAME path.
         self._mm: mmap.mmap | None = None
         self._shm_path: str | None = None
+        # Number of tiles the daemon currently holds resident px/py grids for
+        # (option C). None until the first SETGRID; re-sent on resolution change.
+        self._grid_num_tiles: int | None = None
         self._setup_shared_memory()
 
     # ------------------------------------------------------------------
@@ -198,7 +201,26 @@ class KernelBackend(Backend):
                 sorted_gaussian_ids, tile_ranges, H, W,
             )
 
-        # Sub-stage B: write device-ready buffers directly into shm.
+        # Sub-stage B0: upload the static px/py grids once per resolution. They
+        # never change at a fixed grid, so re-encoding/re-uploading them every
+        # frame is wasted work — write them to shm and hand them to the daemon
+        # via SETGRID, which keeps them resident on-device (option C). Truncated
+        # bf16 (top 16 bits of fp32, matching fp32_tile_to_bf16's `u >> 16`).
+        if self._grid_num_tiles != num_tiles:
+            px_view = np.ndarray((num_tiles * 1024,), dtype=np.uint16,
+                                 buffer=self._mm, offset=px_off)
+            py_view = np.ndarray((num_tiles * 1024,), dtype=np.uint16,
+                                 buffer=self._mm, offset=py_off)
+            px_view[:] = (np.ascontiguousarray(px).reshape(-1).view(np.uint32) >> 16).astype(np.uint16)
+            py_view[:] = (np.ascontiguousarray(py).reshape(-1).view(np.uint32) >> 16).astype(np.uint16)
+            self._proc.stdin.write(f"SETGRID {num_tiles} {px_off} {py_off}\n")
+            self._proc.stdin.flush()
+            resp = self._read_response(30.0, accept=("SETGRID_OK", "ERR"))
+            if resp != "SETGRID_OK":
+                raise RuntimeError(f"daemon SETGRID error: {resp!r}")
+            self._grid_num_tiles = num_tiles
+
+        # Sub-stage B: write the per-frame device-ready buffers into shm.
         t = time.perf_counter()
         # packs -> (N, 16) fp32 pages (9 used + 7 zero-pad).
         packs_view = np.ndarray((total_entries, 16), dtype=np.float32,
@@ -209,21 +231,13 @@ class KernelBackend(Backend):
         off_view = np.ndarray((offsets_count,), dtype=np.uint32,
                               buffer=self._mm, offset=offsets_off)
         off_view[:] = offsets
-        # px/py -> truncated bf16 (top 16 bits of fp32, matching the daemon's
-        # fp32_tile_to_bf16 `u >> 16` — bit-identical, so PSNR is unchanged).
-        px_view = np.ndarray((num_tiles * 1024,), dtype=np.uint16,
-                             buffer=self._mm, offset=px_off)
-        py_view = np.ndarray((num_tiles * 1024,), dtype=np.uint16,
-                             buffer=self._mm, offset=py_off)
-        px_view[:] = (np.ascontiguousarray(px).reshape(-1).view(np.uint32) >> 16).astype(np.uint16)
-        py_view[:] = (np.ascontiguousarray(py).reshape(-1).view(np.uint32) >> 16).astype(np.uint16)
         write_ms = (time.perf_counter() - t) * 1000.0
 
         # Sub-stage C: daemon round-trip (upload + kernel + readback into shm).
         t = time.perf_counter()
         line = (
             f"MFRAME {H} {W} {total_entries} {num_tiles} {offsets_count} "
-            f"{packs_off} {offsets_off} {px_off} {py_off} {out_off}\n"
+            f"{packs_off} {offsets_off} {out_off}\n"
         )
         self._proc.stdin.write(line)
         self._proc.stdin.flush()

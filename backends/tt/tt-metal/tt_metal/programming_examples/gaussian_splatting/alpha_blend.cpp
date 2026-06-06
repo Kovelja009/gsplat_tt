@@ -174,6 +174,13 @@ struct DeviceContext {
     // of the FRAME path. nullptr until MMAP succeeds.
     void* shm_base = nullptr;
     size_t shm_cap = 0;
+    // Resident px/py grids (option C). At a fixed resolution the per-pixel
+    // coordinate tiles never change, so they are uploaded once via SETGRID
+    // and reused by every MFRAME instead of being re-encoded/re-uploaded each
+    // frame. resident_num_tiles is the grid they are valid for (0 = unset).
+    std::shared_ptr<distributed::MeshBuffer> px_resident;
+    std::shared_ptr<distributed::MeshBuffer> py_resident;
+    uint32_t resident_num_tiles = 0;
 };
 
 // Build a Program with all CBs allocated and the 3 kernels compiled.
@@ -459,25 +466,34 @@ struct FrameDramBuffers {
 // Allocate the 6 DRAM buffers a frame needs. Sizes are derived from the
 // scene's total_entries + tile count + the LPT-balanced tile-id list.
 // All buffers are RAII via shared_ptr; they free on scope exit.
+static std::shared_ptr<distributed::MeshBuffer> make_dram_buffer(
+    DeviceContext& ctx, size_t bytes, size_t page_bytes) {
+    distributed::ReplicatedBufferConfig rc{.size = bytes};
+    distributed::DeviceLocalBufferConfig lc{
+        .page_size = page_bytes, .buffer_type = BufferType::DRAM};
+    return distributed::MeshBuffer::create(rc, lc, ctx.mesh_device.get());
+}
+
+// Allocate the DRAM buffers a frame needs. When alloc_pxpy is false the px/py
+// buffers are left null (the MFRAME path fills them from resident buffers that
+// persist across frames — see the SETGRID command), so they are neither
+// reallocated nor re-uploaded per frame.
 static FrameDramBuffers allocate_frame_buffers(
     DeviceContext& ctx,
     uint32_t total_entries,
     uint32_t num_tiles,
     size_t offsets_count,
-    size_t tile_ids_bytes) {
-    auto make_dram = [&](size_t bytes, size_t page_bytes) {
-        distributed::ReplicatedBufferConfig rc{.size = bytes};
-        distributed::DeviceLocalBufferConfig lc{
-            .page_size = page_bytes, .buffer_type = BufferType::DRAM};
-        return distributed::MeshBuffer::create(rc, lc, ctx.mesh_device.get());
-    };
+    size_t tile_ids_bytes,
+    bool alloc_pxpy = true) {
     FrameDramBuffers b;
-    b.packs    = make_dram(static_cast<size_t>(total_entries) * SCALAR_PACK_PAGE_BYTES, SCALAR_PACK_PAGE_BYTES);
-    b.offsets  = make_dram(offsets_count * sizeof(uint32_t), sizeof(uint32_t));
-    b.px       = make_dram(static_cast<size_t>(num_tiles) * TILE_BYTES_BF16, TILE_BYTES_BF16);
-    b.py       = make_dram(static_cast<size_t>(num_tiles) * TILE_BYTES_BF16, TILE_BYTES_BF16);
-    b.output   = make_dram(static_cast<size_t>(num_tiles) * 3 * TILE_BYTES_BF16, TILE_BYTES_BF16);
-    b.tile_ids = make_dram(tile_ids_bytes, TILE_IDS_PAGE_BYTES);
+    b.packs    = make_dram_buffer(ctx, static_cast<size_t>(total_entries) * SCALAR_PACK_PAGE_BYTES, SCALAR_PACK_PAGE_BYTES);
+    b.offsets  = make_dram_buffer(ctx, offsets_count * sizeof(uint32_t), sizeof(uint32_t));
+    if (alloc_pxpy) {
+        b.px   = make_dram_buffer(ctx, static_cast<size_t>(num_tiles) * TILE_BYTES_BF16, TILE_BYTES_BF16);
+        b.py   = make_dram_buffer(ctx, static_cast<size_t>(num_tiles) * TILE_BYTES_BF16, TILE_BYTES_BF16);
+    }
+    b.output   = make_dram_buffer(ctx, static_cast<size_t>(num_tiles) * 3 * TILE_BYTES_BF16, TILE_BYTES_BF16);
+    b.tile_ids = make_dram_buffer(ctx, tile_ids_bytes, TILE_IDS_PAGE_BYTES);
     return b;
 }
 
@@ -630,7 +646,7 @@ struct MFrameInputs {
     uint32_t total_entries;
     uint32_t num_tiles;
     uint32_t offsets_count;
-    size_t packs_off, offsets_off, px_off, py_off, out_off;
+    size_t packs_off, offsets_off, out_off;
 };
 
 // Zero-copy counterpart of process_frame(): inputs are already device-ready in
@@ -656,6 +672,9 @@ static double process_mframe(DeviceContext& ctx, const MFrameInputs& f) {
     if (f.out_off + out_bytes > ctx.shm_cap) {
         throw std::runtime_error("MFRAME buffers exceed mapped shm capacity");
     }
+    if (ctx.resident_num_tiles != num_tiles || !ctx.px_resident) {
+        throw std::runtime_error("MFRAME before SETGRID for this resolution");
+    }
 
     // 1. LPT assignment needs per-tile Gaussian counts; offsets live as u32.
     const uint32_t* offs_u32 = reinterpret_cast<const uint32_t*>(base + f.offsets_off);
@@ -670,7 +689,10 @@ static double process_mframe(DeviceContext& ctx, const MFrameInputs& f) {
 
     FrameDramBuffers bufs = allocate_frame_buffers(
         ctx, f.total_entries, num_tiles, f.offsets_count,
-        assign.tile_id_buffer_bytes_padded);
+        assign.tile_id_buffer_bytes_padded, /*alloc_pxpy=*/false);
+    // px/py are resident (uploaded once via SETGRID); reuse their addresses.
+    bufs.px = ctx.px_resident;
+    bufs.py = ctx.py_resident;
     const auto t_alloc = prof_clk::now();
     const auto t_encode = t_alloc;  // no encode: shm is already device-ready
 
@@ -681,11 +703,10 @@ static double process_mframe(DeviceContext& ctx, const MFrameInputs& f) {
     // Kernel timing window: upload start -> readback end (matches process_frame).
     const auto t_start = std::chrono::steady_clock::now();
     std::vector<uint16_t> output_zero(out_bytes / sizeof(uint16_t), 0);
+    // px/py are already resident on-device — not re-uploaded here (option C).
     ctx.cq->enqueue_write_mesh_buffer(bufs.output,   output_zero.data(),                   false);
     ctx.cq->enqueue_write_mesh_buffer(bufs.packs,    base + f.packs_off,                   false);
     ctx.cq->enqueue_write_mesh_buffer(bufs.offsets,  base + f.offsets_off,                 false);
-    ctx.cq->enqueue_write_mesh_buffer(bufs.px,       base + f.px_off,                      false);
-    ctx.cq->enqueue_write_mesh_buffer(bufs.py,       base + f.py_off,                      false);
     ctx.cq->enqueue_write_mesh_buffer(bufs.tile_ids, assign.tile_id_buffer_padded.data(),  false);
     distributed::EnqueueMeshWorkload(*ctx.cq, ctx.workload, /*blocking=*/false);
     ctx.cq->enqueue_read_mesh_buffer(base + f.out_off, bufs.output, /*blocking=*/true);
@@ -768,12 +789,44 @@ static int run_daemon() {
             continue;
         }
 
-        // MFRAME H W total_entries num_tiles offsets_count packs_off offsets_off px_off py_off out_off
+        // SETGRID num_tiles px_off py_off: upload the static px/py grids once
+        // into resident DRAM buffers reused by subsequent MFRAMEs (option C).
+        if (cmd == "SETGRID") {
+            size_t num_tiles = 0, px_off = 0, py_off = 0;
+            if (!(iss >> num_tiles >> px_off >> py_off)) {
+                std::cout << "ERR malformed SETGRID line" << std::endl;
+                std::cout.flush();
+                continue;
+            }
+            if (ctx.shm_base == nullptr) {
+                std::cout << "ERR SETGRID before MMAP" << std::endl;
+                std::cout.flush();
+                continue;
+            }
+            try {
+                if (ctx.resident_num_tiles != num_tiles) {
+                    ctx.px_resident = make_dram_buffer(ctx, num_tiles * TILE_BYTES_BF16, TILE_BYTES_BF16);
+                    ctx.py_resident = make_dram_buffer(ctx, num_tiles * TILE_BYTES_BF16, TILE_BYTES_BF16);
+                    ctx.resident_num_tiles = static_cast<uint32_t>(num_tiles);
+                }
+                uint8_t* base = static_cast<uint8_t*>(ctx.shm_base);
+                ctx.cq->enqueue_write_mesh_buffer(ctx.px_resident, base + px_off, false);
+                ctx.cq->enqueue_write_mesh_buffer(ctx.py_resident, base + py_off, /*blocking=*/true);
+                std::cout << "SETGRID_OK" << std::endl;
+                std::cout.flush();
+            } catch (const std::exception& e) {
+                std::cout << "ERR " << e.what() << std::endl;
+                std::cout.flush();
+            }
+            continue;
+        }
+
+        // MFRAME H W total_entries num_tiles offsets_count packs_off offsets_off out_off
         if (cmd == "MFRAME") {
             MFrameInputs f;
             if (!(iss >> f.image_h >> f.image_w >> f.total_entries >> f.num_tiles
                       >> f.offsets_count >> f.packs_off >> f.offsets_off
-                      >> f.px_off >> f.py_off >> f.out_off)) {
+                      >> f.out_off)) {
                 std::cout << "ERR malformed MFRAME line" << std::endl;
                 std::cout.flush();
                 continue;

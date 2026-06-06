@@ -556,14 +556,6 @@ static Program& get_program_for_workload(DeviceContext& ctx) {
 // Returns the kernel-only elapsed time (EnqueueWriteBuffer start ->
 // EnqueueReadBuffer end) in milliseconds.
 static double process_frame(DeviceContext& ctx, const FrameInputs& f) {
-    // Phase profiling (emitted to stderr as GSPLAT_TIMING; the stdout "OK"
-    // protocol the host parses is unaffected). Splits the non-kernel portion
-    // of the daemon round-trip into load / assign / alloc / encode / save.
-    using prof_clk = std::chrono::steady_clock;
-    auto prof_ms = [](prof_clk::time_point a, prof_clk::time_point b) {
-        return std::chrono::duration<double, std::milli>(b - a).count();
-    };
-    const auto t_prof0 = prof_clk::now();
     const uint32_t image_h = f.image_h;
     const uint32_t image_w = f.image_w;
     const uint32_t tiles_x = (image_w + TILE_W - 1) / TILE_W;
@@ -578,11 +570,9 @@ static double process_frame(DeviceContext& ctx, const FrameInputs& f) {
     auto px_f32      = load_npy_f32(f.px_path,      px_shape);
     auto py_f32      = load_npy_f32(f.py_path,      py_shape);
     const uint32_t total_entries = static_cast<uint32_t>(packs_shape[0]);
-    const auto t_load = prof_clk::now();
 
     // 2. LPT-balanced tile-to-core assignment.
     const TileAssignment assign = build_tile_assignment(offsets_f32, num_tiles, num_cores);
-    const auto t_assign = prof_clk::now();
 
     // 3. Allocate per-frame DRAM buffers and prepare upload payloads.
     // (Non-const because EnqueueWrite/ReadMeshBuffer takes non-const lvalue
@@ -590,7 +580,6 @@ static double process_frame(DeviceContext& ctx, const FrameInputs& f) {
     FrameDramBuffers bufs = allocate_frame_buffers(
         ctx, total_entries, num_tiles, offsets_f32.size(),
         assign.tile_id_buffer_bytes_padded);
-    const auto t_alloc = prof_clk::now();
     auto packs_payload = encode_attribute_packs(packs_f32, total_entries);
     auto px_bf16 = encode_tiles_to_bf16(px_f32, num_tiles);
     auto py_bf16 = encode_tiles_to_bf16(py_f32, num_tiles);
@@ -598,12 +587,10 @@ static double process_frame(DeviceContext& ctx, const FrameInputs& f) {
     for (size_t i = 0; i < offsets_f32.size(); i++) {
         offsets_u32[i] = static_cast<uint32_t>(offsets_f32[i]);
     }
-    const auto t_encode = prof_clk::now();
 
     // 4. Refresh runtime args for this frame.
     Program& program = get_program_for_workload(ctx);
     set_per_core_runtime_args(program, ctx, bufs, assign);
-    const auto t_args = prof_clk::now();
 
     // 5. Kernel timing window: DRAM upload start -> output readback end.
     const auto t_start = std::chrono::steady_clock::now();
@@ -630,17 +617,6 @@ static double process_frame(DeviceContext& ctx, const FrameInputs& f) {
     // 6. Tile-major bf16 output -> row-major fp32 image; save .npy.
     const auto img = tiles_to_image(result_bf16, num_tiles, tiles_x, image_h, image_w);
     save_npy_f32(f.out_path, img, {image_h, image_w, 3});
-    const auto t_save = prof_clk::now();
-
-    std::cerr << "GSPLAT_TIMING"
-              << " load="   << prof_ms(t_prof0,  t_load)
-              << " assign=" << prof_ms(t_load,   t_assign)
-              << " alloc="  << prof_ms(t_assign, t_alloc)
-              << " encode=" << prof_ms(t_alloc,  t_encode)
-              << " args="   << prof_ms(t_encode, t_args)
-              << " kernel=" << kernel_ms
-              << " save="   << prof_ms(t_end,    t_save)
-              << " total="  << prof_ms(t_prof0,  t_save) << std::endl;
     return kernel_ms;
 }
 
@@ -657,49 +633,13 @@ struct MFrameInputs {
     size_t packs_off, offsets_off, out_off;
 };
 
-// One-shot diagnostic: upload ~approx_bytes of host data into throwaway DRAM
-// buffers at a range of page sizes, reporting effective GB/s for each. The
-// real packs buffer uses a 64-byte page (one pack per Gaussian) -> hundreds of
-// thousands of pages; this isolates whether the upload is bound by per-page
-// overhead (GB/s rises with page size) or raw bandwidth (GB/s flat). Gated by
-// GSPLAT_PROBE_UPLOAD; runs once, decoupled from the kernel.
-static void probe_upload_bandwidth(DeviceContext& ctx, size_t approx_bytes) {
-    using clk = std::chrono::steady_clock;
-    const int iters = 10;
-    std::cerr << "GSPLAT_PROBE upload-bandwidth approx_bytes=" << approx_bytes
-              << " iters=" << iters << std::endl;
-    for (size_t page : {size_t(64), size_t(256), size_t(1024), size_t(4096), size_t(16384)}) {
-        const size_t bytes = ((approx_bytes + page - 1) / page) * page;
-        const size_t npages = bytes / page;
-        auto buf = make_dram_buffer(ctx, bytes, page);
-        std::vector<uint8_t> host(bytes, 0);
-        ctx.cq->enqueue_write_mesh_buffer(buf, host.data(), /*blocking=*/true);  // warmup
-        const auto t0 = clk::now();
-        for (int i = 0; i < iters; i++) {
-            ctx.cq->enqueue_write_mesh_buffer(buf, host.data(), /*blocking=*/false);
-        }
-        distributed::Finish(*ctx.cq);
-        const auto t1 = clk::now();
-        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
-        const double gbps = (static_cast<double>(bytes) / 1e9) / (ms / 1e3);
-        std::cerr << "GSPLAT_PROBE page=" << page << " pages=" << npages
-                  << " bytes=" << bytes << " ms=" << ms << " GBps=" << gbps << std::endl;
-    }
-}
-
 // Zero-copy counterpart of process_frame(): inputs are already device-ready in
-// shared memory (packs in 64-byte pages, offsets u32, px/py truncated bf16), so
-// there is no .npy load and no fp32->bf16 encode. Uploads straight from the
-// mapped region and reads the bf16 result back into it; the host does the
-// tile-major -> image rearrange. Returns kernel-only ms (same window as
-// process_frame, so the "OK <ms>" the host parses keeps its meaning).
+// shared memory (dense 64-byte packs paged at 4 KB, offsets u32, px/py
+// truncated bf16), so there is no .npy load and no fp32->bf16 encode. Uploads
+// straight from the mapped region and reads the bf16 result back into it; the
+// host does the tile-major -> image rearrange. Returns kernel-only ms (same
+// window as process_frame, so the "OK <ms>" the host parses keeps its meaning).
 static double process_mframe(DeviceContext& ctx, const MFrameInputs& f) {
-    using prof_clk = std::chrono::steady_clock;
-    auto prof_ms = [](prof_clk::time_point a, prof_clk::time_point b) {
-        return std::chrono::duration<double, std::milli>(b - a).count();
-    };
-    const auto t_prof0 = prof_clk::now();
-
     if (ctx.shm_base == nullptr) {
         throw std::runtime_error("MFRAME received before a successful MMAP");
     }
@@ -714,22 +654,13 @@ static double process_mframe(DeviceContext& ctx, const MFrameInputs& f) {
         throw std::runtime_error("MFRAME before SETGRID for this resolution");
     }
 
-    static bool probe_done = false;
-    if (!probe_done && std::getenv("GSPLAT_PROBE_UPLOAD") != nullptr) {
-        probe_done = true;
-        probe_upload_bandwidth(ctx, static_cast<size_t>(f.total_entries) * SCALAR_PACK_PAGE_BYTES);
-    }
-
     // 1. LPT assignment needs per-tile Gaussian counts; offsets live as u32.
     const uint32_t* offs_u32 = reinterpret_cast<const uint32_t*>(base + f.offsets_off);
     std::vector<float> offsets_f32(f.offsets_count);
     for (uint32_t i = 0; i < f.offsets_count; i++) {
         offsets_f32[i] = static_cast<float>(offs_u32[i]);
     }
-    const auto t_load = prof_clk::now();
-
     const TileAssignment assign = build_tile_assignment(offsets_f32, num_tiles, num_cores);
-    const auto t_assign = prof_clk::now();
 
     FrameDramBuffers bufs = allocate_frame_buffers(
         ctx, f.total_entries, num_tiles, f.offsets_count,
@@ -737,59 +668,22 @@ static double process_mframe(DeviceContext& ctx, const MFrameInputs& f) {
     // px/py are resident (uploaded once via SETGRID); reuse their addresses.
     bufs.px = ctx.px_resident;
     bufs.py = ctx.py_resident;
-    const auto t_alloc = prof_clk::now();
-    const auto t_encode = t_alloc;  // no encode: shm is already device-ready
 
     Program& program = get_program_for_workload(ctx);
     set_per_core_runtime_args(program, ctx, bufs, assign);
-    const auto t_args = prof_clk::now();
 
-    // Kernel timing window: upload start -> readback end (matches process_frame).
-    // When GSPLAT_PROFILE_KERNEL is set, Finish() barriers split the window into
-    // upload / compute / readback. Barriers serialize the phases (so the summed
-    // total is slightly higher than the fused fast path), but they attribute
-    // where the on-device time actually goes.
-    static const bool kprofile = std::getenv("GSPLAT_PROFILE_KERNEL") != nullptr;
+    // Kernel timing window: upload start -> readback end. px/py are already
+    // resident on-device (option C), so they are not re-uploaded here.
     const auto t_start = std::chrono::steady_clock::now();
     std::vector<uint16_t> output_zero(out_bytes / sizeof(uint16_t), 0);
-    // px/py are already resident on-device — not re-uploaded here (option C).
     ctx.cq->enqueue_write_mesh_buffer(bufs.output,   output_zero.data(),                   false);
     ctx.cq->enqueue_write_mesh_buffer(bufs.packs,    base + f.packs_off,                   false);
     ctx.cq->enqueue_write_mesh_buffer(bufs.offsets,  base + f.offsets_off,                 false);
     ctx.cq->enqueue_write_mesh_buffer(bufs.tile_ids, assign.tile_id_buffer_padded.data(),  false);
-    if (kprofile) {
-        distributed::Finish(*ctx.cq);
-        const auto t_up = std::chrono::steady_clock::now();
-        distributed::EnqueueMeshWorkload(*ctx.cq, ctx.workload, /*blocking=*/false);
-        distributed::Finish(*ctx.cq);
-        const auto t_cp = std::chrono::steady_clock::now();
-        ctx.cq->enqueue_read_mesh_buffer(base + f.out_off, bufs.output, /*blocking=*/true);
-        const auto t_rb = std::chrono::steady_clock::now();
-        std::cerr << "GSPLAT_KPROFILE"
-                  << " upload="    << prof_ms(t_start, t_up)
-                  << " compute="   << prof_ms(t_up,    t_cp)
-                  << " readback="  << prof_ms(t_cp,    t_rb)
-                  << " entries="   << f.total_entries
-                  << " num_tiles=" << num_tiles << std::endl;
-    } else {
-        distributed::EnqueueMeshWorkload(*ctx.cq, ctx.workload, /*blocking=*/false);
-        ctx.cq->enqueue_read_mesh_buffer(base + f.out_off, bufs.output, /*blocking=*/true);
-    }
+    distributed::EnqueueMeshWorkload(*ctx.cq, ctx.workload, /*blocking=*/false);
+    ctx.cq->enqueue_read_mesh_buffer(base + f.out_off, bufs.output, /*blocking=*/true);
     const auto t_end = std::chrono::steady_clock::now();
-    const double kernel_ms =
-        std::chrono::duration<double, std::milli>(t_end - t_start).count();
-    const auto t_save = prof_clk::now();  // no daemon-side save: host reads shm
-
-    std::cerr << "GSPLAT_TIMING(mframe)"
-              << " load="   << prof_ms(t_prof0,  t_load)
-              << " assign=" << prof_ms(t_load,   t_assign)
-              << " alloc="  << prof_ms(t_assign, t_alloc)
-              << " encode=" << prof_ms(t_alloc,  t_encode)
-              << " args="   << prof_ms(t_encode, t_args)
-              << " kernel=" << kernel_ms
-              << " save="   << prof_ms(t_end,    t_save)
-              << " total="  << prof_ms(t_prof0,  t_save) << std::endl;
-    return kernel_ms;
+    return std::chrono::duration<double, std::milli>(t_end - t_start).count();
 }
 
 // ---------------------------------------------------------------------------

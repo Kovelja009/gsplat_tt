@@ -128,7 +128,7 @@ class Pipeline:
         with self._timer(timings, "tile_assign"):
             gaussian_ids, tile_ids, _ = self.backend.tile_assign(
                 means_2d, radii, image_height, image_width,
-                tile_size=self.tile_size, covs_2d=covs_2d,
+                tile_size=self.tile_size,
             )
         tiles_x = (image_width + self.tile_size - 1) // self.tile_size
         tiles_y = (image_height + self.tile_size - 1) // self.tile_size

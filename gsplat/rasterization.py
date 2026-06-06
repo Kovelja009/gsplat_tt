@@ -145,25 +145,20 @@ def get_tile_assignments(
     image_height: int,
     image_width: int,
     tile_size: int = 32,
-    covs_2d: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Assign each visible Gaussian to the screen tiles it overlaps.
 
     The screen is divided into a grid of tile_size x tile_size pixel tiles.
-    Each Gaussian's bounding box (center +/- per-axis 3σ extent) is tested
-    against the tile grid to find all tiles it touches, producing a list of
-    (gaussian_idx, tile_id) pairs telling us which Gaussians feed which tiles.
+    Each Gaussian's bounding circle (center + radius) is tested against the tile grid
+    to find all tiles it touches. This produces a list of (gaussian_idx, tile_id) pairs
+    that tells us which Gaussians contribute to which tiles.
 
     Args:
         means_2d: (M, 2) screen-space positions of visible Gaussians.
-        radii: (M,) bounding *circle* radius in pixels (at 3σ, = 3*sqrt(lambda_max)).
-            Used when covs_2d is not given.
+        radii: (M,) bounding circle radius in pixels (at 3σ).
         image_height: output image height in pixels.
         image_width: output image width in pixels.
         tile_size: tile dimension in pixels (default 32x32, matches the kernel).
-        covs_2d: optional (M, 2, 2) 2D covariances. When given, the per-axis AABB
-            extent_x = 3*sqrt(cov00), extent_y = 3*sqrt(cov11) is used instead of
-            the circular radius — tighter for elongated Gaussians (see note below).
 
     Returns:
         gaussian_ids: (P,) index into means_2d for each Gaussian-tile pair.
@@ -173,26 +168,20 @@ def get_tile_assignments(
     tiles_x = (image_width + tile_size - 1) // tile_size
     tiles_y = (image_height + tile_size - 1) // tile_size
 
-    # Per-axis 3σ extents for the bounding box. The circular `radii` is derived
-    # from lambda_max (largest eigenvalue), so it's the same in x and y and
-    # over-covers elongated Gaussians — assigning tiles the ellipse never
-    # meaningfully reaches (those pixels evaluate to near-zero alpha). With
-    # covs_2d we use the tighter AABB of the ellipse: extent_x = 3*sqrt(cov00),
-    # extent_y = 3*sqrt(cov11) (what diff-gaussian-rasterization uses). The AABB
-    # box is always a subset of the circular box (cov00, cov11 <= lambda_max), so
-    # this only ever removes near-zero-contribution tiles — never adds any.
-    if covs_2d is not None:
-        radii_x = torch.ceil(3.0 * torch.sqrt(torch.clamp(covs_2d[:, 0, 0], min=0.0)))
-        radii_y = torch.ceil(3.0 * torch.sqrt(torch.clamp(covs_2d[:, 1, 1], min=0.0)))
-    else:
-        radii_x = radii_y = radii
-
+    """ NOTE: radii is derived from lambda_max (largest eigenvalue), so the bounding region
+    is a circle, not an ellipse. For elongated Gaussians this overestimates — some tiles
+    will be assigned even though the Gaussian barely reaches them. This is conservative
+    (no visual errors), just slightly more work in alpha blending where those pixels will
+    evaluate to near-zero alpha and get skipped. A tighter approach would use an AABB from
+    the covariance diagonal: extent_x = 3*sqrt(cov[0,0]), extent_y = 3*sqrt(cov[1,1]),
+    which is what the original CUDA implementation (diff-gaussian-rasterization) uses.
+    """
     # Compute the tile range each Gaussian's bounding box covers.
     # Clamp to valid tile indices [0, tiles_x) and [0, tiles_y)
-    tile_min_x = torch.clamp((means_2d[:, 0] - radii_x) / tile_size, min=0, max=tiles_x - 1).int()
-    tile_max_x = torch.clamp((means_2d[:, 0] + radii_x) / tile_size, min=0, max=tiles_x - 1).int()
-    tile_min_y = torch.clamp((means_2d[:, 1] - radii_y) / tile_size, min=0, max=tiles_y - 1).int()
-    tile_max_y = torch.clamp((means_2d[:, 1] + radii_y) / tile_size, min=0, max=tiles_y - 1).int()
+    tile_min_x = torch.clamp((means_2d[:, 0] - radii) / tile_size, min=0, max=tiles_x - 1).int()
+    tile_max_x = torch.clamp((means_2d[:, 0] + radii) / tile_size, min=0, max=tiles_x - 1).int()
+    tile_min_y = torch.clamp((means_2d[:, 1] - radii) / tile_size, min=0, max=tiles_y - 1).int()
+    tile_max_y = torch.clamp((means_2d[:, 1] + radii) / tile_size, min=0, max=tiles_y - 1).int()
 
     # Width and height of each Gaussian's tile bounding box
     widths = tile_max_x - tile_min_x + 1

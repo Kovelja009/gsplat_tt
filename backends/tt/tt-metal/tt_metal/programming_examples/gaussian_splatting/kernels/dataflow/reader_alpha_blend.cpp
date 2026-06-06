@@ -83,6 +83,10 @@ void kernel_main() {
     // Gaussian and trample adjacent L1 (manifests as a multi-tile hang once
     // the corrupted L1 overlaps a CB descriptor).
     constexpr uint32_t pack_bytes_padded = 64;  // matches host SCALAR_PACK_PAGE_BYTES
+    // packs live in 4 KB DRAM pages (64 packs each) so host->DRAM upload is not
+    // page-count-bound; matches host SCALAR_PACK_DRAM_PAGE_BYTES / PACKS_PER_DRAM_PAGE.
+    constexpr uint32_t packs_dram_page_bytes = 4096;
+    constexpr uint32_t packs_per_page = packs_dram_page_bytes / pack_bytes_padded;  // 64
     constexpr uint32_t tile_ids_page_bytes = 64;  // matches host TILE_IDS_PAGE_BYTES
 
     constexpr auto packs_args     = TensorAccessorArgs<0>();
@@ -91,7 +95,7 @@ void kernel_main() {
     constexpr auto py_args        = TensorAccessorArgs<px_args.next_compile_time_args_offset()>();
     constexpr auto tile_ids_args  = TensorAccessorArgs<py_args.next_compile_time_args_offset()>();
 
-    const auto packs_acc    = TensorAccessor(packs_args,    packs_addr,        pack_bytes_padded);
+    const auto packs_acc    = TensorAccessor(packs_args,    packs_addr,        packs_dram_page_bytes);
     const auto offsets_acc  = TensorAccessor(offsets_args,  tile_offsets_addr, /*page_size=*/4);
     const auto px_acc       = TensorAccessor(px_args,       px_addr,           tile_bytes);
     const auto py_acc       = TensorAccessor(py_args,       py_addr,           tile_bytes);
@@ -195,8 +199,15 @@ void kernel_main() {
         // CB_SCALARS depth (4) lets the reader prefetch ahead of compute.
         for (uint32_t g = 0; g < g_count; g++) {
             uint32_t entry_id = g_start + g;
+            // packs are stored densely but paged at 4 KB (packs_per_page packs
+            // per page) for fast host upload. Address pack entry_id as page
+            // entry_id/64 at byte offset (entry_id%64)*64, and read just its
+            // 64 bytes into CB_SCALARS.
+            uint32_t pk_page = entry_id / packs_per_page;
+            uint32_t pk_off  = (entry_id % packs_per_page) * pack_bytes_padded;
             cb_reserve_back(CB_SCALARS, 1);
-            noc_async_read_tile(entry_id, packs_acc, get_write_ptr(CB_SCALARS));
+            uint64_t pk_noc = get_noc_addr(pk_page, packs_acc) + pk_off;
+            noc_async_read(pk_noc, get_write_ptr(CB_SCALARS), pack_bytes_padded);
             noc_async_read_barrier();
             cb_push_back(CB_SCALARS, 1);
         }

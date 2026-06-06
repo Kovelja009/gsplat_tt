@@ -398,12 +398,20 @@ static TileAssignment build_tile_assignment(
     return a;
 }
 
-// Pack N x 9 fp32 attribute rows into 64-byte pages
-// (9 fp32 = 36 bytes payload, 28 bytes zero-padded per row).
+// Bytes the packs DRAM buffer occupies: a dense run of 64-byte packs, rounded
+// up to a whole number of 4 KB DRAM pages (see SCALAR_PACK_DRAM_PAGE_BYTES).
+// The trailing pad pages are never read by the reader (entry_id < total_entries).
+static inline size_t packs_dram_bytes(uint32_t total_entries) {
+    const size_t dense = static_cast<size_t>(total_entries) * SCALAR_PACK_PAGE_BYTES;
+    return ((dense + SCALAR_PACK_DRAM_PAGE_BYTES - 1) / SCALAR_PACK_DRAM_PAGE_BYTES)
+           * SCALAR_PACK_DRAM_PAGE_BYTES;
+}
+
+// Pack N x 9 fp32 attribute rows into 64-byte packs (9 fp32 = 36 bytes payload,
+// 28 bytes zero-padded per pack), in a buffer rounded up to whole 4 KB pages.
 static std::vector<uint32_t> encode_attribute_packs(
     const std::vector<float>& packs_f32, uint32_t total_entries) {
-    std::vector<uint32_t> packs_payload(
-        (static_cast<size_t>(total_entries) * SCALAR_PACK_PAGE_BYTES) / 4, 0);
+    std::vector<uint32_t> packs_payload(packs_dram_bytes(total_entries) / 4, 0);
     constexpr size_t row_payload_bytes = 9 * sizeof(float);
     for (uint32_t e = 0; e < total_entries; e++) {
         std::memcpy(
@@ -486,7 +494,7 @@ static FrameDramBuffers allocate_frame_buffers(
     size_t tile_ids_bytes,
     bool alloc_pxpy = true) {
     FrameDramBuffers b;
-    b.packs    = make_dram_buffer(ctx, static_cast<size_t>(total_entries) * SCALAR_PACK_PAGE_BYTES, SCALAR_PACK_PAGE_BYTES);
+    b.packs    = make_dram_buffer(ctx, packs_dram_bytes(total_entries), SCALAR_PACK_DRAM_PAGE_BYTES);
     b.offsets  = make_dram_buffer(ctx, offsets_count * sizeof(uint32_t), sizeof(uint32_t));
     if (alloc_pxpy) {
         b.px   = make_dram_buffer(ctx, static_cast<size_t>(num_tiles) * TILE_BYTES_BF16, TILE_BYTES_BF16);

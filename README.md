@@ -162,10 +162,15 @@ on the synthetic 640×640 / 10K-Gaussian blend round-trip unless noted:
 | Keep static px/py grids resident on-device (`SETGRID`) | 26 ms | 3.0× |
 
 - **Zero-copy `MFRAME`** maps one `/dev/shm` region into both host and daemon.
-  The host writes device-ready bytes (bf16 px/py, 64-byte scalar packs) straight
-  into it; the daemon uploads to DRAM and reads results back via pointer with no
-  `.npy` serialize/parse and no fp32↔bf16 conversion. The `.npy` `FRAME` path is
-  kept as a fallback (and for the test suite).
+  Each frame the host writes the per-frame buffers — the 64-byte scalar packs and
+  per-tile offsets — straight into it in device-ready form; the daemon uploads
+  them to DRAM and reads the result back via pointer, with no `.npy`
+  serialize/parse and no fp32↔bf16 conversion. The `.npy` `FRAME` path is kept as
+  a fallback (and for the test suite).
+- **Resident px/py grids (`SETGRID`)** — the per-pixel coordinate grids don't
+  change at a fixed resolution, so they aren't shipped per frame: they're
+  uploaded once (first frame / on resolution change) into DRAM buffers the daemon
+  keeps resident and reuses for every subsequent `MFRAME`.
 - **4 KB scalar-packs DRAM page** — paging the packs buffer at 4 KB (64 packs/
   page) instead of 64 B lifts host→DRAM upload from ~1.6 GB/s to ~40 GB/s; it
   was page-count bound (~235K tiny pages).

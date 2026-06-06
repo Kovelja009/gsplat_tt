@@ -77,13 +77,16 @@ class Backend(ABC):
         image_height: int,
         image_width: int,
         tile_size: int = 32,
+        covs_2d: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Tile-overlap assignment.
 
-        Returns: (gaussian_ids, tile_ids, tiles_per_gaussian).
+        When covs_2d is given, uses the tighter per-axis AABB instead of the
+        circular radius. Returns: (gaussian_ids, tile_ids, tiles_per_gaussian).
         """
         return rasterization.get_tile_assignments(
             means_2d, radii, image_height, image_width, tile_size=tile_size,
+            covs_2d=covs_2d,
         )
 
     def sort(

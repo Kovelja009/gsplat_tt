@@ -649,6 +649,36 @@ struct MFrameInputs {
     size_t packs_off, offsets_off, out_off;
 };
 
+// One-shot diagnostic: upload ~approx_bytes of host data into throwaway DRAM
+// buffers at a range of page sizes, reporting effective GB/s for each. The
+// real packs buffer uses a 64-byte page (one pack per Gaussian) -> hundreds of
+// thousands of pages; this isolates whether the upload is bound by per-page
+// overhead (GB/s rises with page size) or raw bandwidth (GB/s flat). Gated by
+// GSPLAT_PROBE_UPLOAD; runs once, decoupled from the kernel.
+static void probe_upload_bandwidth(DeviceContext& ctx, size_t approx_bytes) {
+    using clk = std::chrono::steady_clock;
+    const int iters = 10;
+    std::cerr << "GSPLAT_PROBE upload-bandwidth approx_bytes=" << approx_bytes
+              << " iters=" << iters << std::endl;
+    for (size_t page : {size_t(64), size_t(256), size_t(1024), size_t(4096), size_t(16384)}) {
+        const size_t bytes = ((approx_bytes + page - 1) / page) * page;
+        const size_t npages = bytes / page;
+        auto buf = make_dram_buffer(ctx, bytes, page);
+        std::vector<uint8_t> host(bytes, 0);
+        ctx.cq->enqueue_write_mesh_buffer(buf, host.data(), /*blocking=*/true);  // warmup
+        const auto t0 = clk::now();
+        for (int i = 0; i < iters; i++) {
+            ctx.cq->enqueue_write_mesh_buffer(buf, host.data(), /*blocking=*/false);
+        }
+        distributed::Finish(*ctx.cq);
+        const auto t1 = clk::now();
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+        const double gbps = (static_cast<double>(bytes) / 1e9) / (ms / 1e3);
+        std::cerr << "GSPLAT_PROBE page=" << page << " pages=" << npages
+                  << " bytes=" << bytes << " ms=" << ms << " GBps=" << gbps << std::endl;
+    }
+}
+
 // Zero-copy counterpart of process_frame(): inputs are already device-ready in
 // shared memory (packs in 64-byte pages, offsets u32, px/py truncated bf16), so
 // there is no .npy load and no fp32->bf16 encode. Uploads straight from the
@@ -674,6 +704,12 @@ static double process_mframe(DeviceContext& ctx, const MFrameInputs& f) {
     }
     if (ctx.resident_num_tiles != num_tiles || !ctx.px_resident) {
         throw std::runtime_error("MFRAME before SETGRID for this resolution");
+    }
+
+    static bool probe_done = false;
+    if (!probe_done && std::getenv("GSPLAT_PROBE_UPLOAD") != nullptr) {
+        probe_done = true;
+        probe_upload_bandwidth(ctx, static_cast<size_t>(f.total_entries) * SCALAR_PACK_PAGE_BYTES);
     }
 
     // 1. LPT assignment needs per-tile Gaussian counts; offsets live as u32.

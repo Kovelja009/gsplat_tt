@@ -448,8 +448,10 @@ def prepare_kernel_inputs(
     attribute_packs = np.empty((total_entries, 9), dtype=np.float32)
 
     # tile_offsets: cumulative count up to each tile, plus a final total.
-    # Equivalent to walking tile_ranges in order, since sort_and_bin produces
-    # contiguous ranges for non-empty tiles and (0, 0) for empties.
+    # Equivalent to walking tile_ranges in order: sort_and_bin produces
+    # contiguous ranges in ascending tile order, so an empty tile has
+    # start == end (a zero-width range at the running cumulative position),
+    # and counts = ends - starts is 0 for it.
     counts = (ranges_np[:, 1] - ranges_np[:, 0]).astype(np.uint32)
     tile_offsets = np.zeros(num_tiles + 1, dtype=np.uint32)
     tile_offsets[1:] = np.cumsum(counts)

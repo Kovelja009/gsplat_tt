@@ -36,9 +36,14 @@ from gsplat.backend import Backend
 from gsplat.rasterization import prepare_kernel_inputs
 
 # Device-buffer layout constants (must match alpha_blend_host.h).
-SCALAR_PACK_PAGE_BYTES = 64          # 9 fp32 payload + zero pad
+SCALAR_PACK_PAGE_BYTES = 64          # per-Gaussian pack stride (9 fp32 + zero pad)
 TILE_BYTES_BF16 = 32 * 32 * 2        # one bf16 32x32 tile = 2 KB
-_SHM_ALIGN = 4096                    # page-align each region in the shm
+TILE_ELEMS = 32 * 32                 # elements per 32x32 tile (= TILE_BYTES_BF16 // 2)
+# Per-region alignment in the shm. MUST be a multiple of the daemon's
+# scalar-packs DRAM page (SCALAR_PACK_DRAM_PAGE_BYTES = 4096 in alpha_blend_host.h):
+# the daemon uploads the whole rounded-up packs buffer from packs_off, so the
+# packs region must end on that page boundary (where the next region begins).
+_SHM_ALIGN = 4096
 _SHM_CAPACITY = 512 * 1024 * 1024    # 512 MB; tmpfs-backed, lazily paged
 
 
@@ -108,7 +113,9 @@ class KernelBackend(Backend):
             os.close(fd)
             self._proc.stdin.write(f"MMAP {path} {_SHM_CAPACITY}\n")
             self._proc.stdin.flush()
-            resp = self._read_response(30.0)
+            # Only MMAP_OK / a real ERR reply — not a stray "OK ..." log line
+            # the runtime may still be flushing right after READY.
+            resp = self._read_response(30.0, accept=("MMAP_OK", "ERR "))
             if resp != "MMAP_OK":
                 mm.close()
                 os.unlink(path)
@@ -122,11 +129,14 @@ class KernelBackend(Backend):
             except OSError:
                 pass
 
-    def _read_response(self, timeout_s: float, accept: tuple[str, ...] = ("OK ", "ERR", "MMAP_OK")) -> str:
+    def _read_response(self, timeout_s: float, accept: tuple[str, ...] = ("OK ", "ERR ", "MMAP_OK")) -> str:
         """Read stdout, skipping non-protocol log lines, until a response.
 
-        Returns the first line that startswith any of `accept`, or raises on
-        timeout / closed pipe.
+        Returns the first line that equals or startswith any of `accept`, or
+        raises on timeout / closed pipe. Note the daemon's error replies are
+        "ERR <msg>", so callers match the prefix "ERR " (with the space) rather
+        than "ERR" — otherwise a runtime "ERROR:" log line would be mistaken
+        for a protocol error.
         """
         deadline = time.perf_counter() + timeout_s
         while time.perf_counter() < deadline:
@@ -137,6 +147,26 @@ class KernelBackend(Backend):
             if any(line == a or line.startswith(a) for a in accept):
                 return line
         raise RuntimeError("daemon timeout waiting for response")
+
+    def _send_frame(self, line: str) -> tuple[float, float | None]:
+        """Send a FRAME/MFRAME request and wait for the daemon's reply.
+
+        Returns (round_trip_ms, device_kernel_ms). device_kernel_ms is parsed
+        from the daemon's "OK <ms>" (None if absent). Raises on an ERR reply.
+        """
+        t = time.perf_counter()
+        self._proc.stdin.write(line)
+        self._proc.stdin.flush()
+        resp = self._read_response(30.0, accept=("OK ", "ERR "))
+        if not resp.startswith("OK "):
+            raise RuntimeError(f"daemon error: {resp!r}")
+        rt_ms = (time.perf_counter() - t) * 1000.0
+        kernel_ms: float | None = None
+        try:
+            kernel_ms = float(resp.split(maxsplit=1)[1])
+        except (IndexError, ValueError):
+            pass
+        return rt_ms, kernel_ms
 
     # ------------------------------------------------------------------
     # Backend API
@@ -207,15 +237,15 @@ class KernelBackend(Backend):
         # via SETGRID, which keeps them resident on-device (option C). Truncated
         # bf16 (top 16 bits of fp32, matching fp32_tile_to_bf16's `u >> 16`).
         if self._grid_num_tiles != num_tiles:
-            px_view = np.ndarray((num_tiles * 1024,), dtype=np.uint16,
+            px_view = np.ndarray((num_tiles * TILE_ELEMS,), dtype=np.uint16,
                                  buffer=self._mm, offset=px_off)
-            py_view = np.ndarray((num_tiles * 1024,), dtype=np.uint16,
+            py_view = np.ndarray((num_tiles * TILE_ELEMS,), dtype=np.uint16,
                                  buffer=self._mm, offset=py_off)
             px_view[:] = (np.ascontiguousarray(px).reshape(-1).view(np.uint32) >> 16).astype(np.uint16)
             py_view[:] = (np.ascontiguousarray(py).reshape(-1).view(np.uint32) >> 16).astype(np.uint16)
             self._proc.stdin.write(f"SETGRID {num_tiles} {px_off} {py_off}\n")
             self._proc.stdin.flush()
-            resp = self._read_response(30.0, accept=("SETGRID_OK", "ERR"))
+            resp = self._read_response(30.0, accept=("SETGRID_OK", "ERR "))
             if resp != "SETGRID_OK":
                 raise RuntimeError(f"daemon SETGRID error: {resp!r}")
             self._grid_num_tiles = num_tiles
@@ -234,22 +264,11 @@ class KernelBackend(Backend):
         write_ms = (time.perf_counter() - t) * 1000.0
 
         # Sub-stage C: daemon round-trip (upload + kernel + readback into shm).
-        t = time.perf_counter()
         line = (
             f"MFRAME {H} {W} {total_entries} {num_tiles} {offsets_count} "
             f"{packs_off} {offsets_off} {out_off}\n"
         )
-        self._proc.stdin.write(line)
-        self._proc.stdin.flush()
-        resp = self._read_response(30.0, accept=("OK ", "ERR"))
-        if not resp.startswith("OK "):
-            raise RuntimeError(f"daemon error: {resp!r}")
-        rt_ms = (time.perf_counter() - t) * 1000.0
-        kernel_ms = None
-        try:
-            kernel_ms = float(resp.split(maxsplit=1)[1])
-        except (IndexError, ValueError):
-            pass
+        rt_ms, kernel_ms = self._send_frame(line)
 
         # Sub-stage D: read bf16 output from shm and rearrange to (H, W, 3).
         t = time.perf_counter()
@@ -307,23 +326,11 @@ class KernelBackend(Backend):
         save_ms = (time.perf_counter() - t_save) * 1000.0
 
         # Sub-stage C: daemon round-trip (DRAM upload + kernel + readback).
-        t_rt = time.perf_counter()
         line = (
             f"FRAME {H} {W} "
             f"{td}/packs.npy {td}/offsets.npy {td}/px.npy {td}/py.npy {td}/out.npy\n"
         )
-        self._proc.stdin.write(line)
-        self._proc.stdin.flush()
-        resp = self._read_response(30.0, accept=("OK ", "ERR"))
-        if not resp.startswith("OK "):
-            raise RuntimeError(f"daemon error: {resp!r}")
-        rt_ms = (time.perf_counter() - t_rt) * 1000.0
-
-        kernel_ms = None
-        try:
-            kernel_ms = float(resp.split(maxsplit=1)[1])
-        except (IndexError, ValueError):
-            pass
+        rt_ms, kernel_ms = self._send_frame(line)
 
         # Sub-stage D: load the rendered image from the daemon's .npy.
         t_load = time.perf_counter()

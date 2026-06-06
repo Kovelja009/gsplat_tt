@@ -701,6 +701,11 @@ static double process_mframe(DeviceContext& ctx, const MFrameInputs& f) {
     const auto t_args = prof_clk::now();
 
     // Kernel timing window: upload start -> readback end (matches process_frame).
+    // When GSPLAT_PROFILE_KERNEL is set, Finish() barriers split the window into
+    // upload / compute / readback. Barriers serialize the phases (so the summed
+    // total is slightly higher than the fused fast path), but they attribute
+    // where the on-device time actually goes.
+    static const bool kprofile = std::getenv("GSPLAT_PROFILE_KERNEL") != nullptr;
     const auto t_start = std::chrono::steady_clock::now();
     std::vector<uint16_t> output_zero(out_bytes / sizeof(uint16_t), 0);
     // px/py are already resident on-device — not re-uploaded here (option C).
@@ -708,8 +713,24 @@ static double process_mframe(DeviceContext& ctx, const MFrameInputs& f) {
     ctx.cq->enqueue_write_mesh_buffer(bufs.packs,    base + f.packs_off,                   false);
     ctx.cq->enqueue_write_mesh_buffer(bufs.offsets,  base + f.offsets_off,                 false);
     ctx.cq->enqueue_write_mesh_buffer(bufs.tile_ids, assign.tile_id_buffer_padded.data(),  false);
-    distributed::EnqueueMeshWorkload(*ctx.cq, ctx.workload, /*blocking=*/false);
-    ctx.cq->enqueue_read_mesh_buffer(base + f.out_off, bufs.output, /*blocking=*/true);
+    if (kprofile) {
+        distributed::Finish(*ctx.cq);
+        const auto t_up = std::chrono::steady_clock::now();
+        distributed::EnqueueMeshWorkload(*ctx.cq, ctx.workload, /*blocking=*/false);
+        distributed::Finish(*ctx.cq);
+        const auto t_cp = std::chrono::steady_clock::now();
+        ctx.cq->enqueue_read_mesh_buffer(base + f.out_off, bufs.output, /*blocking=*/true);
+        const auto t_rb = std::chrono::steady_clock::now();
+        std::cerr << "GSPLAT_KPROFILE"
+                  << " upload="    << prof_ms(t_start, t_up)
+                  << " compute="   << prof_ms(t_up,    t_cp)
+                  << " readback="  << prof_ms(t_cp,    t_rb)
+                  << " entries="   << f.total_entries
+                  << " num_tiles=" << num_tiles << std::endl;
+    } else {
+        distributed::EnqueueMeshWorkload(*ctx.cq, ctx.workload, /*blocking=*/false);
+        ctx.cq->enqueue_read_mesh_buffer(base + f.out_off, bufs.output, /*blocking=*/true);
+    }
     const auto t_end = std::chrono::steady_clock::now();
     const double kernel_ms =
         std::chrono::duration<double, std::milli>(t_end - t_start).count();

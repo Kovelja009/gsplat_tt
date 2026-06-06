@@ -14,7 +14,7 @@ The same viewer can dispatch to multiple rasterizers:
 | `backend` | Status | What |
 |---|---|---|
 | `cpu`  | shipping | Pure PyTorch reference. Slow (~1–2 s/frame at 256×256), used as the correctness baseline. |
-| `tt`   | shipping | tt-metal kernels on a Tenstorrent Wormhole device. ~80 ms/frame at 640×640 (21.7× CPU). |
+| `tt`   | shipping | tt-metal kernels on a Tenstorrent Wormhole/Blackhole device. ~30 ms/frame for a small scene at 640×640; scales with Gaussian count (see [Performance](#performance)). |
 | `cuda` | experimental | JIT-compiles on first use via `torch.utils.cpp_extension`. Requires a CUDA-capable GPU and `requirements-cuda.txt` installed. |
 
 Pipeline (CPU does setup, the chosen backend does the alpha-blend):
@@ -81,6 +81,11 @@ plus the median total and the FPS implied by it. Each backend's
 `blend(...)` may also report sub-timings (e.g. `blend.device_kernel`),
 which are nested under the parent stage in the table.
 
+For headless, repeatable benchmarking there are scripts under `scripts/`:
+`bench_scene.py` runs the full pipeline on a real `.ply` and prints the
+per-stage breakdown; `bench_mmap.py` A/Bs the zero-copy vs `.npy` hand-off and
+checks the outputs are bit-identical.
+
 ## Setup details
 
 `./setup.sh` is idempotent and does:
@@ -127,23 +132,53 @@ gsplat_tt/
 
 ## Performance
 
-640×640, 10K random Gaussians:
+Per-frame cost splits between the on-device alpha-blend **kernel** and the
+**host↔device data path** that feeds it (the CPU project/tile/sort stages plus
+moving per-frame buffers to the daemon). Both have been optimized; all changes
+below preserve the image bit-for-bit (or to ~41 dB PSNR vs the CPU reference).
 
-| Backend | Frame time | Speedup |
-|---|---|---|
-| CPU PyTorch (16 x86 cores) | ~1740 ms | 1.0× |
-| TT, single Tensix core | ~2515 ms | 0.69× |
-| TT, 64 cores (contiguous split) | ~120 ms | 14.5× |
-| **TT, 64 cores (LPT load balancing)** | **~80 ms** | **21.7×** |
+### End-to-end (real scenes, 640×640, full pipeline, TT backend)
 
-bonsai.ply (1.16M Gaussians, Mip-NeRF 360) at 640×384:
+| Scene | Gaussians | Frame time | |
+|---|--:|--:|--:|
+| luigi.ply | 14.5K | ~30 ms | ~33 fps |
+| point_cloud.ply (Mip-NeRF 360) | 742K | ~315 ms | ~3 fps |
 
-| State | Frame time |
-|---|---|
-| Naive (accurate exp, no culls) | ~6.0 s |
-| + approx exp | ~5.1 s |
-| + opacity cull (< 1/255) | ~2.5 s |
-| **+ radius cap** | **~0.6–0.9 s** |
+The CPU reference renders the same scenes at seconds-to-minutes per frame
+(its alpha-blend alone is ~3.5 s on luigi). On the 742K scene the device
+kernel is ~130 ms; the rest is host CPU stages.
+
+### Host ↔ device data path
+
+The daemon receives each frame's inputs and returns the rendered image. The
+hand-off and the entry sort were the bulk of a real frame; the wins, measured
+on the synthetic 640×640 / 10K-Gaussian blend round-trip unless noted:
+
+| Change | round-trip | |
+|---|--:|---|
+| Baseline — `.npy` files on disk-backed `/tmp` | 77 ms | 1.0× |
+| Stage `.npy` on tmpfs (`/dev/shm`) | 54 ms | 1.4× |
+| Zero-copy shared-memory hand-off (`MFRAME`, mmap, no `.npy`) | 27 ms | 2.9× |
+| Keep static px/py grids resident on-device (`SETGRID`) | 26 ms | 3.0× |
+
+- **Zero-copy `MFRAME`** maps one `/dev/shm` region into both host and daemon.
+  The host writes device-ready bytes (bf16 px/py, 64-byte scalar packs) straight
+  into it; the daemon uploads to DRAM and reads results back via pointer with no
+  `.npy` serialize/parse and no fp32↔bf16 conversion. The `.npy` `FRAME` path is
+  kept as a fallback (and for the test suite).
+- **4 KB scalar-packs DRAM page** — paging the packs buffer at 4 KB (64 packs/
+  page) instead of 64 B lifts host→DRAM upload from ~1.6 GB/s to ~40 GB/s; it
+  was page-count bound (~235K tiny pages).
+- **Integer-key sort** — the entry sort (largest CPU stage on big scenes) moved
+  from a float64 `argsort` to a `torch.sort` over an integer `(tile_id<<32 |
+  depth_bits)` key: **104 → 18 ms** on the 742K scene (~6×).
+
+### Kernel side
+
+The on-device blend uses LPT (longest-processing-time) load balancing across
+Tensix cores (~21× over a single core), approximate `exp`, an opacity cull
+(peak contribution < 1/255), and a bounding-radius cap — the last two together
+cut a 1M+-Gaussian scene from ~6 s to under 1 s.
 
 ## Testing
 

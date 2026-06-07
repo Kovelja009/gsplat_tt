@@ -33,6 +33,10 @@
 #include <utility>
 #include <vector>
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
 #include <tt-metalium/bfloat16.hpp>
 #include <tt-metalium/core_coord.hpp>
 #include <tt-metalium/device.hpp>
@@ -157,12 +161,26 @@ struct DeviceContext {
     KernelHandle reader{};
     KernelHandle compute{};
     KernelHandle writer{};
-    // Full compute grid (e.g. 8x8 on Wormhole N150 after harvesting).
+    // Full compute grid, queried from the device (8x8=64 on Wormhole N150,
+    // 13x10=130 on Blackhole P150 unharvested).
     // CBs and kernels are allocated on every core in this range at init;
     // per-frame, split_work_to_cores carves [0, num_tiles) into a contiguous
     // slice per core via SetRuntimeArgs.
     CoreCoord grid{0, 0};
     CoreRangeSet all_cores;
+    // Shared-memory zero-copy handoff (option B). Mapped once via the MMAP
+    // command; MFRAME frames read inputs from / write output to this region
+    // directly, bypassing the .npy serialize/parse + fp32<->bf16 round-trips
+    // of the FRAME path. nullptr until MMAP succeeds.
+    void* shm_base = nullptr;
+    size_t shm_cap = 0;
+    // Resident px/py grids (option C). At a fixed resolution the per-pixel
+    // coordinate tiles never change, so they are uploaded once via SETGRID
+    // and reused by every MFRAME instead of being re-encoded/re-uploaded each
+    // frame. resident_num_tiles is the grid they are valid for (0 = unset).
+    std::shared_ptr<distributed::MeshBuffer> px_resident;
+    std::shared_ptr<distributed::MeshBuffer> py_resident;
+    uint32_t resident_num_tiles = 0;
 };
 
 // Build a Program with all CBs allocated and the 3 kernels compiled.
@@ -285,6 +303,8 @@ static DeviceContext init_device_context() {
     ctx.cq = &ctx.mesh_device->mesh_command_queue();
     ctx.grid = ctx.mesh_device->compute_with_storage_grid_size();
     ctx.all_cores = CoreRangeSet(CoreRange({0, 0}, {ctx.grid.x - 1, ctx.grid.y - 1}));
+    std::cout << "compute_with_storage_grid_size = " << ctx.grid.x << "x" << ctx.grid.y
+              << " (" << (ctx.grid.x * ctx.grid.y) << " cores)" << std::endl;
     build_program_and_workload(ctx);
     return ctx;
 }
@@ -378,12 +398,20 @@ static TileAssignment build_tile_assignment(
     return a;
 }
 
-// Pack N x 9 fp32 attribute rows into 64-byte pages
-// (9 fp32 = 36 bytes payload, 28 bytes zero-padded per row).
+// Bytes the packs DRAM buffer occupies: a dense run of 64-byte packs, rounded
+// up to a whole number of 4 KB DRAM pages (see SCALAR_PACK_DRAM_PAGE_BYTES).
+// The trailing pad pages are never read by the reader (entry_id < total_entries).
+static inline size_t packs_dram_bytes(uint32_t total_entries) {
+    const size_t dense = static_cast<size_t>(total_entries) * SCALAR_PACK_PAGE_BYTES;
+    return ((dense + SCALAR_PACK_DRAM_PAGE_BYTES - 1) / SCALAR_PACK_DRAM_PAGE_BYTES)
+           * SCALAR_PACK_DRAM_PAGE_BYTES;
+}
+
+// Pack N x 9 fp32 attribute rows into 64-byte packs (9 fp32 = 36 bytes payload,
+// 28 bytes zero-padded per pack), in a buffer rounded up to whole 4 KB pages.
 static std::vector<uint32_t> encode_attribute_packs(
     const std::vector<float>& packs_f32, uint32_t total_entries) {
-    std::vector<uint32_t> packs_payload(
-        (static_cast<size_t>(total_entries) * SCALAR_PACK_PAGE_BYTES) / 4, 0);
+    std::vector<uint32_t> packs_payload(packs_dram_bytes(total_entries) / 4, 0);
     constexpr size_t row_payload_bytes = 9 * sizeof(float);
     for (uint32_t e = 0; e < total_entries; e++) {
         std::memcpy(
@@ -446,25 +474,34 @@ struct FrameDramBuffers {
 // Allocate the 6 DRAM buffers a frame needs. Sizes are derived from the
 // scene's total_entries + tile count + the LPT-balanced tile-id list.
 // All buffers are RAII via shared_ptr; they free on scope exit.
+static std::shared_ptr<distributed::MeshBuffer> make_dram_buffer(
+    DeviceContext& ctx, size_t bytes, size_t page_bytes) {
+    distributed::ReplicatedBufferConfig rc{.size = bytes};
+    distributed::DeviceLocalBufferConfig lc{
+        .page_size = page_bytes, .buffer_type = BufferType::DRAM};
+    return distributed::MeshBuffer::create(rc, lc, ctx.mesh_device.get());
+}
+
+// Allocate the DRAM buffers a frame needs. When alloc_pxpy is false the px/py
+// buffers are left null (the MFRAME path fills them from resident buffers that
+// persist across frames — see the SETGRID command), so they are neither
+// reallocated nor re-uploaded per frame.
 static FrameDramBuffers allocate_frame_buffers(
     DeviceContext& ctx,
     uint32_t total_entries,
     uint32_t num_tiles,
     size_t offsets_count,
-    size_t tile_ids_bytes) {
-    auto make_dram = [&](size_t bytes, size_t page_bytes) {
-        distributed::ReplicatedBufferConfig rc{.size = bytes};
-        distributed::DeviceLocalBufferConfig lc{
-            .page_size = page_bytes, .buffer_type = BufferType::DRAM};
-        return distributed::MeshBuffer::create(rc, lc, ctx.mesh_device.get());
-    };
+    size_t tile_ids_bytes,
+    bool alloc_pxpy = true) {
     FrameDramBuffers b;
-    b.packs    = make_dram(static_cast<size_t>(total_entries) * SCALAR_PACK_PAGE_BYTES, SCALAR_PACK_PAGE_BYTES);
-    b.offsets  = make_dram(offsets_count * sizeof(uint32_t), sizeof(uint32_t));
-    b.px       = make_dram(static_cast<size_t>(num_tiles) * TILE_BYTES_BF16, TILE_BYTES_BF16);
-    b.py       = make_dram(static_cast<size_t>(num_tiles) * TILE_BYTES_BF16, TILE_BYTES_BF16);
-    b.output   = make_dram(static_cast<size_t>(num_tiles) * 3 * TILE_BYTES_BF16, TILE_BYTES_BF16);
-    b.tile_ids = make_dram(tile_ids_bytes, TILE_IDS_PAGE_BYTES);
+    b.packs    = make_dram_buffer(ctx, packs_dram_bytes(total_entries), SCALAR_PACK_DRAM_PAGE_BYTES);
+    b.offsets  = make_dram_buffer(ctx, offsets_count * sizeof(uint32_t), sizeof(uint32_t));
+    if (alloc_pxpy) {
+        b.px   = make_dram_buffer(ctx, static_cast<size_t>(num_tiles) * TILE_BYTES_BF16, TILE_BYTES_BF16);
+        b.py   = make_dram_buffer(ctx, static_cast<size_t>(num_tiles) * TILE_BYTES_BF16, TILE_BYTES_BF16);
+    }
+    b.output   = make_dram_buffer(ctx, static_cast<size_t>(num_tiles) * 3 * TILE_BYTES_BF16, TILE_BYTES_BF16);
+    b.tile_ids = make_dram_buffer(ctx, tile_ids_bytes, TILE_IDS_PAGE_BYTES);
     return b;
 }
 
@@ -584,6 +621,72 @@ static double process_frame(DeviceContext& ctx, const FrameInputs& f) {
 }
 
 // ---------------------------------------------------------------------------
+// Shared-memory (MFRAME) frame: byte offsets into the mapped region for each
+// device-ready buffer. The host lays the buffers out in shm; the daemon reads
+// inputs from / writes the bf16 output to the region in place.
+// ---------------------------------------------------------------------------
+struct MFrameInputs {
+    uint32_t image_h, image_w;
+    uint32_t total_entries;
+    uint32_t num_tiles;
+    uint32_t offsets_count;
+    size_t packs_off, offsets_off, out_off;
+};
+
+// Zero-copy counterpart of process_frame(): inputs are already device-ready in
+// shared memory (dense 64-byte packs paged at 4 KB, offsets u32, px/py
+// truncated bf16), so there is no .npy load and no fp32->bf16 encode. Uploads
+// straight from the mapped region and reads the bf16 result back into it; the
+// host does the tile-major -> image rearrange. Returns kernel-only ms (same
+// window as process_frame, so the "OK <ms>" the host parses keeps its meaning).
+static double process_mframe(DeviceContext& ctx, const MFrameInputs& f) {
+    if (ctx.shm_base == nullptr) {
+        throw std::runtime_error("MFRAME received before a successful MMAP");
+    }
+    uint8_t* base = static_cast<uint8_t*>(ctx.shm_base);
+    const uint32_t num_tiles = f.num_tiles;
+    const uint32_t num_cores = ctx.grid.x * ctx.grid.y;
+    const size_t out_bytes = static_cast<size_t>(num_tiles) * 3 * TILE_BYTES_BF16;
+    if (f.out_off + out_bytes > ctx.shm_cap) {
+        throw std::runtime_error("MFRAME buffers exceed mapped shm capacity");
+    }
+    if (ctx.resident_num_tiles != num_tiles || !ctx.px_resident) {
+        throw std::runtime_error("MFRAME before SETGRID for this resolution");
+    }
+
+    // 1. LPT assignment needs per-tile Gaussian counts; offsets live as u32.
+    const uint32_t* offs_u32 = reinterpret_cast<const uint32_t*>(base + f.offsets_off);
+    std::vector<float> offsets_f32(f.offsets_count);
+    for (uint32_t i = 0; i < f.offsets_count; i++) {
+        offsets_f32[i] = static_cast<float>(offs_u32[i]);
+    }
+    const TileAssignment assign = build_tile_assignment(offsets_f32, num_tiles, num_cores);
+
+    FrameDramBuffers bufs = allocate_frame_buffers(
+        ctx, f.total_entries, num_tiles, f.offsets_count,
+        assign.tile_id_buffer_bytes_padded, /*alloc_pxpy=*/false);
+    // px/py are resident (uploaded once via SETGRID); reuse their addresses.
+    bufs.px = ctx.px_resident;
+    bufs.py = ctx.py_resident;
+
+    Program& program = get_program_for_workload(ctx);
+    set_per_core_runtime_args(program, ctx, bufs, assign);
+
+    // Kernel timing window: upload start -> readback end. px/py are already
+    // resident on-device (option C), so they are not re-uploaded here.
+    const auto t_start = std::chrono::steady_clock::now();
+    std::vector<uint16_t> output_zero(out_bytes / sizeof(uint16_t), 0);
+    ctx.cq->enqueue_write_mesh_buffer(bufs.output,   output_zero.data(),                   false);
+    ctx.cq->enqueue_write_mesh_buffer(bufs.packs,    base + f.packs_off,                   false);
+    ctx.cq->enqueue_write_mesh_buffer(bufs.offsets,  base + f.offsets_off,                 false);
+    ctx.cq->enqueue_write_mesh_buffer(bufs.tile_ids, assign.tile_id_buffer_padded.data(),  false);
+    distributed::EnqueueMeshWorkload(*ctx.cq, ctx.workload, /*blocking=*/false);
+    ctx.cq->enqueue_read_mesh_buffer(base + f.out_off, bufs.output, /*blocking=*/true);
+    const auto t_end = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(t_end - t_start).count();
+}
+
+// ---------------------------------------------------------------------------
 // Daemon mode
 // ---------------------------------------------------------------------------
 
@@ -607,10 +710,98 @@ static int run_daemon() {
         if (line.empty()) {
             continue;
         }
-        // FRAME H W packs offsets px py out
         std::istringstream iss(line);
         std::string cmd;
         iss >> cmd;
+
+        // MMAP <path> <capacity>: map the host's shared region once, up front.
+        if (cmd == "MMAP") {
+            std::string path;
+            size_t cap = 0;
+            if (!(iss >> path >> cap)) {
+                std::cout << "ERR malformed MMAP line" << std::endl;
+                std::cout.flush();
+                continue;
+            }
+            if (ctx.shm_base != nullptr) {
+                munmap(ctx.shm_base, ctx.shm_cap);
+                ctx.shm_base = nullptr;
+                ctx.shm_cap = 0;
+            }
+            int fd = open(path.c_str(), O_RDWR);
+            if (fd < 0) {
+                std::cout << "ERR cannot open shm " << path << std::endl;
+                std::cout.flush();
+                continue;
+            }
+            void* p = mmap(nullptr, cap, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            close(fd);
+            if (p == MAP_FAILED) {
+                std::cout << "ERR mmap failed" << std::endl;
+                std::cout.flush();
+                continue;
+            }
+            ctx.shm_base = p;
+            ctx.shm_cap = cap;
+            std::cout << "MMAP_OK" << std::endl;
+            std::cout.flush();
+            continue;
+        }
+
+        // SETGRID num_tiles px_off py_off: upload the static px/py grids once
+        // into resident DRAM buffers reused by subsequent MFRAMEs (option C).
+        if (cmd == "SETGRID") {
+            size_t num_tiles = 0, px_off = 0, py_off = 0;
+            if (!(iss >> num_tiles >> px_off >> py_off)) {
+                std::cout << "ERR malformed SETGRID line" << std::endl;
+                std::cout.flush();
+                continue;
+            }
+            if (ctx.shm_base == nullptr) {
+                std::cout << "ERR SETGRID before MMAP" << std::endl;
+                std::cout.flush();
+                continue;
+            }
+            try {
+                if (ctx.resident_num_tiles != num_tiles) {
+                    ctx.px_resident = make_dram_buffer(ctx, num_tiles * TILE_BYTES_BF16, TILE_BYTES_BF16);
+                    ctx.py_resident = make_dram_buffer(ctx, num_tiles * TILE_BYTES_BF16, TILE_BYTES_BF16);
+                    ctx.resident_num_tiles = static_cast<uint32_t>(num_tiles);
+                }
+                uint8_t* base = static_cast<uint8_t*>(ctx.shm_base);
+                ctx.cq->enqueue_write_mesh_buffer(ctx.px_resident, base + px_off, false);
+                ctx.cq->enqueue_write_mesh_buffer(ctx.py_resident, base + py_off, /*blocking=*/true);
+                std::cout << "SETGRID_OK" << std::endl;
+                std::cout.flush();
+            } catch (const std::exception& e) {
+                std::cout << "ERR " << e.what() << std::endl;
+                std::cout.flush();
+            }
+            continue;
+        }
+
+        // MFRAME H W total_entries num_tiles offsets_count packs_off offsets_off out_off
+        if (cmd == "MFRAME") {
+            MFrameInputs f;
+            if (!(iss >> f.image_h >> f.image_w >> f.total_entries >> f.num_tiles
+                      >> f.offsets_count >> f.packs_off >> f.offsets_off
+                      >> f.out_off)) {
+                std::cout << "ERR malformed MFRAME line" << std::endl;
+                std::cout.flush();
+                continue;
+            }
+            try {
+                double ms = process_mframe(ctx, f);
+                std::cout << "OK " << std::fixed << std::setprecision(2) << ms << std::endl;
+                std::cout.flush();
+            } catch (const std::exception& e) {
+                std::cout << "ERR " << e.what() << std::endl;
+                std::cout.flush();
+            }
+            continue;
+        }
+
+        // FRAME H W packs offsets px py out  (.npy path; kept for tests)
         if (cmd != "FRAME") {
             std::cout << "ERR unknown command: " << cmd << std::endl;
             std::cout.flush();
@@ -632,6 +823,10 @@ static int run_daemon() {
         }
     }
 
+    if (ctx.shm_base != nullptr) {
+        munmap(ctx.shm_base, ctx.shm_cap);
+        ctx.shm_base = nullptr;
+    }
     bool ok = true;
     if (ctx.mesh_device) {
         ok = ctx.mesh_device->close();

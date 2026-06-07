@@ -7,7 +7,15 @@ constexpr uint32_t TILE_H = 32;
 constexpr uint32_t TILE_W = 32;
 constexpr uint32_t TILE_BYTES_BF16 = TILE_H * TILE_W * 2;     // 2 KB
 constexpr uint32_t SCALAR_PACK_BYTES = 9 * 4;                  // 9 fp32 scalars
-constexpr uint32_t SCALAR_PACK_PAGE_BYTES = 64;                // padded for NoC alignment
+constexpr uint32_t SCALAR_PACK_PAGE_BYTES = 64;                // per-Gaussian pack stride (NoC-aligned)
+// DRAM page size for the scalar-packs buffer. The packs are stored as a dense
+// run of 64-byte packs, but the DRAM buffer is paged at 4 KB (= 64 packs/page)
+// because host->DRAM upload is page-count-bound: a 64-byte page (one page per
+// Gaussian, ~235K pages) tops out at ~1.6 GB/s, while a 4 KB page hits ~40 GB/s
+// (see GSPLAT_PROBE_UPLOAD). The reader addresses pack `e` as page e/64, offset
+// (e%64)*64.
+constexpr uint32_t SCALAR_PACK_DRAM_PAGE_BYTES = 4096;
+constexpr uint32_t PACKS_PER_DRAM_PAGE = SCALAR_PACK_DRAM_PAGE_BYTES / SCALAR_PACK_PAGE_BYTES;  // 64
 constexpr uint32_t META_PAGE_BYTES = 64;                       // padded uint32 page
 
 // CB indices

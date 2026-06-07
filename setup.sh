@@ -85,37 +85,104 @@ if [ -d "$TT_METAL_DIR/.git" ]; then
     rm -rf "$TT_METAL_DIR/.git"
 fi
 
-# ----- 3. Register our kernel subdir in tt-metal's CMake --------------------
-PE_CMAKE="$TT_METAL_DIR/tt_metal/programming_examples/CMakeLists.txt"
-if [ ! -f "$PE_CMAKE" ]; then
-    fail "$PE_CMAKE not found — tt-metal layout has changed; update setup.sh"
+# ----- 3. Register the in-process ttnn op (alpha_blend) in the ttnn build ----
+# (The old standalone daemon programming-example is gone; the kernels now live
+# in the ttnn op below. Nothing to register under programming_examples.)
+
+# ----- 3b. Register the in-process ttnn op (alpha_blend) in the ttnn build ---
+# Our op subtree under ttnn/cpp/.../experimental/gaussian_splatting/ is tracked
+# by git, but the upstream files that REFERENCE it (ttnn/CMakeLists.txt and
+# experimental_nanobind.cpp) are not — so re-inject those edits idempotently on
+# every (re)vendor, mirroring the programming-examples registration above.
+TTNN_CMAKE="$TT_METAL_DIR/ttnn/CMakeLists.txt"
+EXP_NB="$TT_METAL_DIR/ttnn/cpp/ttnn/operations/experimental/experimental_nanobind.cpp"
+OP_SUBDIR="cpp/ttnn/operations/experimental/gaussian_splatting/alpha_blend"
+OP_LINK="TTNN::Ops::Experimental::GaussianSplatting::AlphaBlend"
+if [ -f "$TTNN_CMAKE" ]; then
+    if ! grep -qF "add_subdirectory($OP_SUBDIR)" "$TTNN_CMAKE"; then
+        say "Registering alpha_blend op add_subdirectory in $TTNN_CMAKE"
+        # Insert right after the post_combine_reduce add_subdirectory line.
+        python3 - "$TTNN_CMAKE" "$OP_SUBDIR" <<'PY'
+import sys
+path, subdir = sys.argv[1], sys.argv[2]
+s = open(path).read()
+anchor = "add_subdirectory(cpp/ttnn/operations/experimental/deepseek_prefill/post_combine_reduce)\n"
+ins = f"add_subdirectory({subdir})\n"
+s = s.replace(anchor, anchor + ins, 1) if anchor in s else s + "\n" + ins
+open(path, "w").write(s)
+PY
+    fi
+    if ! grep -qF "$OP_LINK" "$TTNN_CMAKE"; then
+        say "Linking $OP_LINK into the ttnn target"
+        python3 - "$TTNN_CMAKE" "$OP_LINK" <<'PY'
+import sys
+path, lib = sys.argv[1], sys.argv[2]
+s = open(path).read()
+anchor = "        TTNN::Ops::Experimental::DeepSeekPrefill::PostCombineReduce\n"
+ins = f"        {lib}\n"
+s = s.replace(anchor, anchor + ins, 1) if anchor in s else s
+open(path, "w").write(s)
+PY
+    fi
 fi
-if ! grep -qF "add_subdirectory(gaussian_splatting)" "$PE_CMAKE"; then
-    say "Registering gaussian_splatting subdir in $PE_CMAKE"
-    printf "\nadd_subdirectory(gaussian_splatting)\n" >> "$PE_CMAKE"
-else
-    say "gaussian_splatting subdir already registered"
+# The op's nanobind .cpp is compiled into the ttnn python module via the
+# aggregated nanobind source list in ttnn/sources.cmake.
+TTNN_SRCS="$TT_METAL_DIR/ttnn/sources.cmake"
+OP_NB_SRC="cpp/ttnn/operations/experimental/gaussian_splatting/alpha_blend/alpha_blend_nanobind.cpp"
+if [ -f "$TTNN_SRCS" ] && ! grep -qF "$OP_NB_SRC" "$TTNN_SRCS"; then
+    say "Registering alpha_blend nanobind source in $TTNN_SRCS"
+    python3 - "$TTNN_SRCS" "$OP_NB_SRC" <<'PY'
+import sys
+path, src = sys.argv[1], sys.argv[2]
+s = open(path).read()
+anchor = "    cpp/ttnn/operations/experimental/deepseek_prefill/post_combine_reduce/post_combine_reduce_nanobind.cpp\n"
+ins = f"    {src}\n"
+s = s.replace(anchor, anchor + ins, 1) if anchor in s else s
+open(path, "w").write(s)
+PY
+fi
+if [ -f "$EXP_NB" ] && ! grep -qF "gaussian_splatting/alpha_blend/alpha_blend_nanobind.hpp" "$EXP_NB"; then
+    say "Wiring alpha_blend nanobind into $EXP_NB"
+    python3 - "$EXP_NB" <<'PY'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+inc_anchor = '#include "ttnn/operations/experimental/deepseek_prefill/post_combine_reduce/post_combine_reduce_nanobind.hpp"\n'
+inc = '#include "ttnn/operations/experimental/gaussian_splatting/alpha_blend/alpha_blend_nanobind.hpp"\n'
+if inc_anchor in s:
+    s = s.replace(inc_anchor, inc_anchor + inc, 1)
+call_anchor = '    deepseek_prefill::detail::bind_post_combine_reduce(mod);\n'
+call = '    gaussian_splatting::alpha_blend::detail::bind_gaussian_alpha_blend(mod);\n'
+if call_anchor in s:
+    s = s.replace(call_anchor, call_anchor + call, 1)
+open(path, "w").write(s)
+PY
 fi
 
-# ----- 4. Build tt-metal + our kernel ---------------------------------------
-# Flags:
-#   --build-programming-examples   pulls in programming_examples/ and thus our
-#                                  gaussian_splatting subproject (otherwise the
-#                                  `metal_example_gaussian_splatting` target is
-#                                  never created).
-#   --without-python-bindings      skips the `ttnn` Python wheel build. We only
-#                                  need the C++ tt-metal libs and our binary —
-#                                  `backends/tt/backend.py` invokes the binary
-#                                  as a subprocess, so the runtime never imports
-#                                  `ttnn`. Skipping it also avoids tt-metal's
-#                                  separate `python_env`/`create_venv.sh` step,
-#                                  which can fail with editable-install errors
-#                                  on newer setuptools.
-say "Building tt-metal + gaussian_splatting kernel (sudo required for SFPI / CPM caches)"
+# ----- 4. Build tt-metal + ttnn (incl. our op) ------------------------------
+# We no longer pass --without-python-bindings, so build_metal.sh builds the
+# ttnn Python extensions (_ttnn.so) including our gaussian_splatting/alpha_blend
+# op. The in-process TT backend imports ttnn directly (no daemon subprocess), so
+# the ttnn wheel is installed into ./venv afterward via `pip install -e`.
+# tt-metal's create_venv.sh / python_env is intentionally NOT used — one
+# interpreter (./venv) runs everything.
+#   --build-programming-examples is kept only because build_metal.sh's other
+#   paths expect it; we build no programming-example of our own anymore.
+say "Building tt-metal + ttnn (Python bindings ON; sudo required for SFPI / CPM caches)"
 warn "First build can take 10-20 minutes."
 pushd "$TT_METAL_DIR" >/dev/null
-sudo ./build_metal.sh --build-programming-examples --without-python-bindings
+sudo ./build_metal.sh --build-programming-examples
 popd >/dev/null
+
+# Install the freshly built ttnn editable wheel into the PROJECT venv (./venv),
+# not tt-metal's python_env. ttnn's editable wheel writes a .pth so `import ttnn`
+# resolves to the vendored tree + built .so files. --no-build-isolation lets the
+# install see the build artifacts and our already-installed setuptools/wheel.
+say "Installing ttnn into ./venv"
+# shellcheck disable=SC1091
+source venv/bin/activate
+pip install --no-build-isolation -e "$TT_METAL_DIR"
+deactivate
 
 # ----- Done ------------------------------------------------------------------
 say "Setup complete."

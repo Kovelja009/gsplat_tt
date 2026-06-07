@@ -85,17 +85,9 @@ if [ -d "$TT_METAL_DIR/.git" ]; then
     rm -rf "$TT_METAL_DIR/.git"
 fi
 
-# ----- 3. Register our kernel subdir in tt-metal's CMake --------------------
-PE_CMAKE="$TT_METAL_DIR/tt_metal/programming_examples/CMakeLists.txt"
-if [ ! -f "$PE_CMAKE" ]; then
-    fail "$PE_CMAKE not found — tt-metal layout has changed; update setup.sh"
-fi
-if ! grep -qF "add_subdirectory(gaussian_splatting)" "$PE_CMAKE"; then
-    say "Registering gaussian_splatting subdir in $PE_CMAKE"
-    printf "\nadd_subdirectory(gaussian_splatting)\n" >> "$PE_CMAKE"
-else
-    say "gaussian_splatting subdir already registered"
-fi
+# ----- 3. Register the in-process ttnn op (alpha_blend) in the ttnn build ----
+# (The old standalone daemon programming-example is gone; the kernels now live
+# in the ttnn op below. Nothing to register under programming_examples.)
 
 # ----- 3b. Register the in-process ttnn op (alpha_blend) in the ttnn build ---
 # Our op subtree under ttnn/cpp/.../experimental/gaussian_splatting/ is tracked
@@ -167,18 +159,15 @@ open(path, "w").write(s)
 PY
 fi
 
-# ----- 4. Build tt-metal + our kernel ---------------------------------------
-# Flags:
-#   --build-programming-examples   pulls in programming_examples/ (our legacy
-#                                  gaussian_splatting host binary still builds)
-#                                  AND, since we no longer pass
-#                                  --without-python-bindings, the ttnn Python
-#                                  extensions. The in-process TT backend imports
-#                                  ttnn directly (no daemon subprocess), so the
-#                                  ttnn wheel is installed into ./venv afterward
-#                                  via `pip install -e`. tt-metal's create_venv.sh
-#                                  / python_env is intentionally NOT used — one
-#                                  interpreter (./venv) runs everything.
+# ----- 4. Build tt-metal + ttnn (incl. our op) ------------------------------
+# We no longer pass --without-python-bindings, so build_metal.sh builds the
+# ttnn Python extensions (_ttnn.so) including our gaussian_splatting/alpha_blend
+# op. The in-process TT backend imports ttnn directly (no daemon subprocess), so
+# the ttnn wheel is installed into ./venv afterward via `pip install -e`.
+# tt-metal's create_venv.sh / python_env is intentionally NOT used — one
+# interpreter (./venv) runs everything.
+#   --build-programming-examples is kept only because build_metal.sh's other
+#   paths expect it; we build no programming-example of our own anymore.
 say "Building tt-metal + ttnn (Python bindings ON; sudo required for SFPI / CPM caches)"
 warn "First build can take 10-20 minutes."
 pushd "$TT_METAL_DIR" >/dev/null

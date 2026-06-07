@@ -220,13 +220,8 @@ __marimo__/
 # Thesis plan for easier navigation (private working doc, not for upstream)
 docs/thesis_plan.md
 
-# Vendored tt-metal tree — ignore contents except our programming_examples/gaussian_splatting subdir
+# Vendored tt-metal tree — ignore contents except our tracked ttnn op subtree (below)
 /backends/tt/tt-metal/*
-!/backends/tt/tt-metal/tt_metal
-/backends/tt/tt-metal/tt_metal/*
-!/backends/tt/tt-metal/tt_metal/programming_examples
-/backends/tt/tt-metal/tt_metal/programming_examples/*
-!/backends/tt/tt-metal/tt_metal/programming_examples/gaussian_splatting
 
 # Our in-process ttnn op lives deep in the ttnn tree; track only that subtree.
 # (Upstream files we edit — ttnn/CMakeLists.txt, experimental_nanobind.cpp — are

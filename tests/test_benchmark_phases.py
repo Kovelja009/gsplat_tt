@@ -39,33 +39,19 @@ def test_cuda_mapping_and_reconciliation():
     assert _approx(b["load"] + b["compute"] + b["return"] + b["transfer"], 30.0)
 
 
-def test_tt_mframe_mapping_and_reconciliation():
+def test_tt_inprocess_mapping_and_reconciliation():
+    # In-process ttnn op emits prep / upload / kernel / download.
     timings = {"project": 5.0, "tile_assign": 2.0, "sort": 3.0,
                "blend": 50.0, "total": 60.0}
-    sub = {"blend.prep": 6.0, "blend.write_shm": 4.0,
-           "blend.mframe_rt": 35.0, "blend.mframe_rt.device_kernel": 25.0,
-           "blend.read_shm": 3.0}
+    sub = {"blend.prep": 6.0, "blend.upload": 4.0,
+           "blend.kernel": 25.0, "blend.download": 3.0}
     b = to_buckets(timings, sub, "tt")
-    assert _approx(b["load"], 10.0)           # prep + write_shm
-    assert _approx(b["compute"], 25.0)        # device_kernel
-    assert _approx(b["return"], 3.0)          # read_shm
+    assert _approx(b["load"], 10.0)           # prep + upload
+    assert _approx(b["compute"], 25.0)        # kernel
+    assert _approx(b["return"], 3.0)          # download
     assert _approx(b["device_kernel"], 25.0)
-    # transfer = 50 - (10+25+3) = 12 (DRAM up/down + IPC inside mframe_rt)
+    # transfer = 50 - (10+25+3) = 12 (untimed LPT schedule + page-array build)
     assert _approx(b["transfer"], 12.0)
-    assert _approx(b["load"] + b["compute"] + b["return"] + b["transfer"], 50.0)
-
-
-def test_tt_npy_fallback_keys():
-    # No mframe_rt/read_shm; daemon .npy path emits daemon_rt.*/load_npy.
-    timings = {"project": 1.0, "tile_assign": 1.0, "sort": 1.0,
-               "blend": 50.0, "total": 53.0}
-    sub = {"blend.prep": 6.0, "blend.save_npy": 4.0,
-           "blend.daemon_rt": 35.0, "blend.daemon_rt.device_kernel": 25.0,
-           "blend.load_npy": 3.0}
-    b = to_buckets(timings, sub, "tt")
-    assert _approx(b["load"], 10.0)           # prep + save_npy
-    assert _approx(b["compute"], 25.0)        # daemon_rt.device_kernel
-    assert _approx(b["return"], 3.0)          # load_npy
     assert _approx(b["load"] + b["compute"] + b["return"] + b["transfer"], 50.0)
 
 

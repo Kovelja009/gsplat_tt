@@ -1,8 +1,9 @@
 """Sweep ONE backend across scenes x resolutions; write CSV + JSON.
 
-The backend is constructed once and held across the whole sweep (TT daemon
-stays warm, CUDA extension stays loaded) — one-shot init cost is excluded,
-matching real interactive use. Per (scene, resolution) cell we run `warmup`
+The backend is constructed once and held across the whole sweep (TT device
+opened once + ttnn program cache stays warm, CUDA extension stays loaded) —
+one-shot init cost is excluded, matching real interactive use. Per (scene,
+resolution) cell we run `warmup`
 unmeasured renders then `measure` timed renders, recording the median
 (primary) and min of every timing, mapped into load/compute/return/transfer.
 

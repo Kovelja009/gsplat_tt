@@ -92,7 +92,7 @@ Sweep one backend across scenes × resolutions, then plot:
 
 ```bash
 source venv/bin/activate
-# one backend per run (TT daemon / CUDA ext warmed once, held across the sweep):
+# one backend per run (TT device / CUDA ext opened once, held across the sweep):
 python -m benchmark.run tt   --res 256 480 640 960
 python -m benchmark.run cuda --res 256 480 640 960
 python -m benchmark.run cpu  --res 256 480 --skip-cpu-above 480   # CPU is slow on train.ply

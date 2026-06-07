@@ -5,22 +5,24 @@
 
 #include "ttnn/tensor/tensor.hpp"
 #include "ttnn/device_operation.hpp"
+#include "ttnn/operations/creation/creation.hpp"  // ttnn::zeros
 
 namespace ttnn::operations::experimental::gaussian_splatting::alpha_blend {
 
 void AlphaBlendDeviceOperation::validate_on_program_cache_hit(
     const operation_attributes_t&, const tensor_args_t& t) {
+    // Every input whose buffer address is patched in override_runtime_arguments
+    // (the warm-frame path) must be on device, or .buffer()->address() null-derefs.
     TT_FATAL(t.packs.storage_type() == StorageType::DEVICE, "packs must be on device");
+    TT_FATAL(t.offsets.storage_type() == StorageType::DEVICE, "offsets must be on device");
+    TT_FATAL(t.px.storage_type() == StorageType::DEVICE, "px must be on device");
+    TT_FATAL(t.py.storage_type() == StorageType::DEVICE, "py must be on device");
     TT_FATAL(t.tile_ids.storage_type() == StorageType::DEVICE, "tile_ids must be on device");
 }
 
 void AlphaBlendDeviceOperation::validate_on_program_cache_miss(
     const operation_attributes_t& a, const tensor_args_t& t) {
     validate_on_program_cache_hit(a, t);
-
-    TT_FATAL(t.offsets.storage_type() == StorageType::DEVICE, "offsets must be on device");
-    TT_FATAL(t.px.storage_type() == StorageType::DEVICE, "px must be on device");
-    TT_FATAL(t.py.storage_type() == StorageType::DEVICE, "py must be on device");
 
     TT_FATAL(t.packs.dtype() == DataType::FLOAT32, "packs must be float32");
     TT_FATAL(t.offsets.dtype() == DataType::UINT32, "offsets must be uint32");
@@ -51,12 +53,12 @@ ttnn::TensorSpec AlphaBlendDeviceOperation::compute_output_specs(
 
 ttnn::Tensor AlphaBlendDeviceOperation::create_output_tensors(
     const operation_attributes_t& a, const tensor_args_t& t) {
-    // NOTE: LPT filtering skips empty tiles, so the writer never touches their
-    // output slots — they must read as background (zero). Phase 2 / Task 2.5
-    // confirms create_device_tensor zero-fills, or replaces this with an
-    // explicit zero-init if it does not.
-    const auto spec = compute_output_specs(a, t);
-    return tt::tt_metal::create_device_tensor(spec, t.packs.device());
+    // LPT filtering skips empty tiles, so the writer never touches their output
+    // pages — they must read as background (zero). Zero-initialise here so the op
+    // is correct for ANY caller, not just a host that masks empties afterward.
+    const ttnn::Shape out_shape({a.num_tiles * 3u, 1024u});
+    return ttnn::zeros(
+        out_shape, DataType::BFLOAT16, Layout::ROW_MAJOR, *t.packs.device(), t.packs.memory_config());
 }
 
 }  // namespace ttnn::operations::experimental::gaussian_splatting::alpha_blend

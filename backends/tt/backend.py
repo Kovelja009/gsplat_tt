@@ -29,11 +29,17 @@ from gsplat.backend import Backend
 from gsplat.rasterization import prepare_kernel_inputs
 from backends.tt.lpt import build_tile_assignment
 
-PACK_FLOATS = 16          # 9 used + 7 zero-pad (matches 64-byte SCALAR_PACK_PAGE)
-PACKS_PER_PAGE = 64       # 4096 / 64
-PACK_PAGE_F32 = 1024      # 4096 / 4
-TILE_ELEMS = 1024         # 32 * 32
-IDS_PER_PAGE = 16         # 64 / 4
+PACK_FLOATS = 16                      # 9 used + 7 zero-pad (64-byte SCALAR_PACK_PAGE)
+PACKS_PER_PAGE = 64                   # 4096 / 64
+PACK_PAGE_F32 = PACK_FLOATS * PACKS_PER_PAGE  # 1024 f32 = one 4096-byte DRAM page
+TILE_ELEMS = 1024                     # 32 * 32
+IDS_PER_PAGE = 16                     # 64 / 4
+# The reader/writer kernels read a core's tile-id slice into a fixed
+# uint32 tile_ids[256] L1 stack array (MAX_TILE_IDS_PER_CORE in the kernels)
+# with no bounds check. LPT balances by Gaussian load, not tile count, so a
+# core can be handed more tiles than this — which would overflow L1. Fail loud
+# here rather than silently corrupt device memory.
+MAX_TILE_IDS_PER_CORE = 256
 
 
 def _fp32_to_bf16_trunc(arr: np.ndarray) -> torch.Tensor:
@@ -53,6 +59,26 @@ class KernelBackend(Backend):
         self.device.enable_program_cache()
         grid = self.device.compute_with_storage_grid_size()
         self.num_cores = grid.x * grid.y
+        # Resident px/py device grids, keyed by (H, W). The per-pixel coordinate
+        # grids depend only on resolution, so upload them once and reuse across
+        # frames (the in-process equivalent of the old daemon's SETGRID).
+        self._grids: dict[tuple[int, int], tuple] = {}
+
+    def _resident_grids(self, H, W, px, py, num_tiles):
+        """Upload (once per resolution) and return the resident px/py device tensors."""
+        key = (H, W)
+        g = self._grids.get(key)
+        if g is None:
+            px_page = np.ascontiguousarray(px).reshape(num_tiles, TILE_ELEMS)
+            py_page = np.ascontiguousarray(py).reshape(num_tiles, TILE_ELEMS)
+            mc, rm = ttnn.DRAM_MEMORY_CONFIG, ttnn.ROW_MAJOR_LAYOUT
+            px_dev = ttnn.from_torch(_fp32_to_bf16_trunc(px_page), dtype=ttnn.bfloat16,
+                                     layout=rm, device=self.device, memory_config=mc)
+            py_dev = ttnn.from_torch(_fp32_to_bf16_trunc(py_page), dtype=ttnn.bfloat16,
+                                     layout=rm, device=self.device, memory_config=mc)
+            g = (px_dev, py_dev)
+            self._grids[key] = g
+        return g
 
     def blend(self, means_2d, covs_2d, colors, opacities,
               sorted_gaussian_ids, tile_ranges, image_height, image_width):
@@ -74,56 +100,58 @@ class KernelBackend(Backend):
         # --- LPT schedule (host) ---
         per_core_offset, per_core_count, tile_ids = build_tile_assignment(
             offsets, num_tiles, self.num_cores)
+        max_per_core = int(per_core_count.max())
+        if max_per_core > MAX_TILE_IDS_PER_CORE:
+            raise RuntimeError(
+                f"per-core tile count {max_per_core} exceeds the kernel cap "
+                f"{MAX_TILE_IDS_PER_CORE} at {H}x{W} ({num_tiles} tiles, {self.num_cores} "
+                f"cores); the reader/writer L1 tile_ids buffer would overflow. "
+                f"Lower the resolution or raise MAX_TILE_IDS_PER_CORE in the kernels.")
 
-        # --- build page-matching host arrays ---
-        t = time.perf_counter()
-        npages = max(1, (total_entries + PACKS_PER_PAGE - 1) // PACKS_PER_PAGE)
-        packs_padded = np.zeros((npages * PACKS_PER_PAGE, PACK_FLOATS), dtype=np.float32)
-        packs_padded[:total_entries, :packs.shape[1]] = packs
-        packs_page = packs_padded.reshape(npages, PACK_PAGE_F32)
+        try:
+            # --- build page-matching host arrays (per-frame: packs/offsets/tile_ids) ---
+            t = time.perf_counter()
+            npages = max(1, (total_entries + PACKS_PER_PAGE - 1) // PACKS_PER_PAGE)
+            packs_padded = np.zeros((npages * PACKS_PER_PAGE, PACK_FLOATS), dtype=np.float32)
+            packs_padded[:total_entries, :packs.shape[1]] = packs
+            packs_page = packs_padded.reshape(npages, PACK_PAGE_F32)
 
-        px_page = np.ascontiguousarray(px).reshape(num_tiles, TILE_ELEMS)
-        py_page = np.ascontiguousarray(py).reshape(num_tiles, TILE_ELEMS)
+            offsets_col = offsets.reshape(-1, 1)
 
-        offsets_col = offsets.reshape(-1, 1)
+            ntid_pages = max(1, (tile_ids.shape[0] + IDS_PER_PAGE - 1) // IDS_PER_PAGE)
+            tile_ids_pad = np.zeros((ntid_pages * IDS_PER_PAGE,), dtype=np.uint32)
+            tile_ids_pad[:tile_ids.shape[0]] = tile_ids
+            tile_ids_page = tile_ids_pad.reshape(ntid_pages, IDS_PER_PAGE)
 
-        ntid_pages = max(1, (tile_ids.shape[0] + IDS_PER_PAGE - 1) // IDS_PER_PAGE)
-        tile_ids_pad = np.zeros((ntid_pages * IDS_PER_PAGE,), dtype=np.uint32)
-        tile_ids_pad[:tile_ids.shape[0]] = tile_ids
-        tile_ids_page = tile_ids_pad.reshape(ntid_pages, IDS_PER_PAGE)
+            # --- upload (ROW_MAJOR DRAM interleaved); px/py are resident per resolution ---
+            mc, rm = ttnn.DRAM_MEMORY_CONFIG, ttnn.ROW_MAJOR_LAYOUT
+            px_dev, py_dev = self._resident_grids(H, W, px, py, num_tiles)
+            packs_dev = ttnn.from_torch(torch.from_numpy(packs_page), dtype=ttnn.float32, layout=rm, device=dev, memory_config=mc)
+            offsets_dev = ttnn.from_torch(_u32_tensor(offsets_col), dtype=ttnn.uint32, layout=rm, device=dev, memory_config=mc)
+            tile_ids_dev = ttnn.from_torch(_u32_tensor(tile_ids_page), dtype=ttnn.uint32, layout=rm, device=dev, memory_config=mc)
+            upload_ms = (time.perf_counter() - t) * 1000.0
 
-        # --- upload to device (ROW_MAJOR DRAM interleaved) ---
-        mc = ttnn.DRAM_MEMORY_CONFIG
-        rm = ttnn.ROW_MAJOR_LAYOUT
-        packs_dev = ttnn.from_torch(torch.from_numpy(packs_page), dtype=ttnn.float32, layout=rm, device=dev, memory_config=mc)
-        offsets_dev = ttnn.from_torch(_u32_tensor(offsets_col), dtype=ttnn.uint32, layout=rm, device=dev, memory_config=mc)
-        px_dev = ttnn.from_torch(_fp32_to_bf16_trunc(px_page), dtype=ttnn.bfloat16, layout=rm, device=dev, memory_config=mc)
-        py_dev = ttnn.from_torch(_fp32_to_bf16_trunc(py_page), dtype=ttnn.bfloat16, layout=rm, device=dev, memory_config=mc)
-        tile_ids_dev = ttnn.from_torch(_u32_tensor(tile_ids_page), dtype=ttnn.uint32, layout=rm, device=dev, memory_config=mc)
-        upload_ms = (time.perf_counter() - t) * 1000.0
+            # --- op call (warm after first frame per resolution); op zero-inits empty tiles ---
+            t = time.perf_counter()
+            out = ttnn.experimental.gaussian_alpha_blend(
+                packs_dev, offsets_dev, px_dev, py_dev, tile_ids_dev,
+                image_height=H, image_width=W, num_tiles=num_tiles,
+                per_core_offset=[int(x) for x in per_core_offset],
+                per_core_count=[int(x) for x in per_core_count])
+            kernel_ms = (time.perf_counter() - t) * 1000.0
 
-        # --- op call (warm after first frame per resolution) ---
-        t = time.perf_counter()
-        out = ttnn.experimental.gaussian_alpha_blend(
-            packs_dev, offsets_dev, px_dev, py_dev, tile_ids_dev,
-            image_height=H, image_width=W, num_tiles=num_tiles,
-            per_core_offset=[int(x) for x in per_core_offset],
-            per_core_count=[int(x) for x in per_core_count])
-        kernel_ms = (time.perf_counter() - t) * 1000.0
-
-        # --- readback (num_tiles*3, 1024) bf16 -> (H, W, 3) ---
-        t = time.perf_counter()
-        out_t = ttnn.to_torch(out).float().numpy()          # (num_tiles*3, 1024)
-        tiles = out_t.reshape(num_tiles, 3, 32, 32).copy()
-        # LPT skips empty tiles, so the writer never touches their output slots
-        # and the op-created tensor leaves them uninitialised. Zero them: an
-        # empty tile is one whose per-tile Gaussian count (offsets diff) is 0.
-        counts = offsets[1:num_tiles + 1].astype(np.int64) - offsets[:num_tiles].astype(np.int64)
-        empty = counts == 0
-        if empty.any():
-            tiles[empty] = 0.0
-        image = self._tiles_to_image(tiles, tiles_x, tiles_y, H, W)
-        download_ms = (time.perf_counter() - t) * 1000.0
+            # --- readback (num_tiles*3, 1024) bf16 -> (H, W, 3) ---
+            t = time.perf_counter()
+            out_t = ttnn.to_torch(out).float().numpy()          # (num_tiles*3, 1024)
+            tiles = out_t.reshape(num_tiles, 3, 32, 32)
+            image = self._tiles_to_image(tiles, tiles_x, tiles_y, H, W)
+            download_ms = (time.perf_counter() - t) * 1000.0
+        except Exception as e:
+            # No daemon to isolate faults in-process; surface a clear error with
+            # context instead of a bare ttnn/device exception.
+            raise RuntimeError(
+                f"TT alpha_blend failed at {H}x{W} ({total_entries} entries, "
+                f"{num_tiles} tiles): {e}") from e
 
         return image, {
             "prep": prep_ms, "upload": upload_ms,

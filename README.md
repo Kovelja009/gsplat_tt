@@ -27,7 +27,8 @@ load_ply → project → tile-assign → sort  ──►  alpha_blend (cpu | tt 
 ## Quick start
 
 ```bash
-# 1) one-shot bootstrap (creates ./venv, vendors tt-metal, builds the kernel)
+# 1) one-shot bootstrap (creates ./venv, vendors tt-metal, builds the ttnn op,
+#    and installs ttnn into ./venv)
 ./setup.sh
 
 # 2) CPU viewer (no Tenstorrent device required)
@@ -77,34 +78,40 @@ visible Gaussians) are excluded from the aggregate.
 
 The report records date, backend, scene, Gaussian count, the actual
 modal `W×H`, and the per-stage **median** across all sampled frames —
-plus the median total and the FPS implied by it. Each backend's
-`blend(...)` may also report sub-timings (e.g. `blend.device_kernel`),
-which are nested under the parent stage in the table.
+plus the median total and the FPS implied by it. The TT backend's
+`blend(...)` reports sub-timings (`prep`, `upload`, `kernel`, `download`),
+nested under the parent stage in the table.
 
-For headless, repeatable benchmarking there are scripts under `scripts/`:
-`bench_scene.py` runs the full pipeline on a real `.ply` and prints the
-per-stage breakdown; `bench_mmap.py` A/Bs the zero-copy vs `.npy` hand-off and
-checks the outputs are bit-identical.
+For headless, repeatable benchmarking, `scripts/bench_scene.py` runs the full
+pipeline on a real `.ply` and prints the per-stage breakdown (pass `--cpu` to
+also compare against the CPU reference and print the PSNR).
 
 ## Setup details
 
 `./setup.sh` is idempotent and does:
 
 1. Create `./venv`, install `requirements.txt`, and `pip install -e .`
-   (this puts the `gsplat` command on PATH).
+   (this puts the `gsplat` command on PATH). `numpy` is pinned `<2` because
+   ttnn requires it.
 2. Clone `tenstorrent/tt-metal` into `backends/tt/tt-metal/` (~5 GB).
-3. Register our kernel subdir in tt-metal's CMake (`add_subdirectory`).
-4. `sudo ./build_metal.sh --build-programming-examples --without-python-bindings`
-   to compile the C++ libs + our kernel host binary. `sudo` is needed for
-   tt-metal's root-owned SFPI / CPM caches; we skip the `ttnn` Python wheel
-   because the runtime only invokes the binary as a subprocess.
+3. Inject the build wiring for our ttnn op into tt-metal's CMake / nanobind
+   (idempotent; only our op subtree is tracked by git).
+4. `sudo ./build_metal.sh --build-programming-examples` to compile the C++ libs
+   **and** the ttnn Python extension (including our op), then
+   `pip install -e backends/tt/tt-metal` to install `ttnn` into `./venv`. `sudo`
+   is needed for tt-metal's root-owned SFPI / CPM caches.
+
+The TT backend drives the device **in-process** through a custom ttnn op
+(`ttnn.experimental.gaussian_alpha_blend`) — there is no daemon subprocess, and
+everything (viewer, tests, `ttnn`) runs in the single `./venv`.
 
 Pin a specific tt-metal version with `TT_METAL_REF=v1.2.3 ./setup.sh`.
 
-After editing kernel C++ sources, rebuild just the binary:
+After editing the op host code or kernels, rebuild the ttnn extension (the
+editable install picks it up, no reinstall):
 
 ```bash
-sudo ninja -C backends/tt/tt-metal/build metal_example_gaussian_splatting
+sudo ./backends/tt/tt-metal/build_metal.sh --build-programming-examples
 ```
 
 ## Repository layout
@@ -124,59 +131,59 @@ gsplat_tt/
 └── backends/                  # one subpackage per accelerator
     ├── README.md              # how to add a new backend
     ├── tt/                    # Tenstorrent (tt-metal)
-    │   ├── backend.py         # daemon-subprocess wrapper
-    │   └── tt-metal/          # vendored SDK + our kernels under
-    │       └── tt_metal/programming_examples/gaussian_splatting/
+    │   ├── backend.py         # in-process ttnn-op caller (open device once)
+    │   ├── lpt.py             # host-side LPT tile→core load balancer
+    │   └── tt-metal/          # vendored SDK + our ttnn op under
+    │       └── ttnn/cpp/ttnn/operations/experimental/gaussian_splatting/alpha_blend/
     └── cuda/                  # CUDA backend (kernels JIT-compiled on first use)
 ```
 
 ## Performance
 
-Per-frame cost splits between the on-device alpha-blend **kernel** and the
-**host↔device data path** that feeds it (the CPU project/tile/sort stages plus
-moving per-frame buffers to the daemon). Both have been optimized; all changes
-below preserve the image bit-for-bit (or to ~41 dB PSNR vs the CPU reference).
+The TT backend opens the device once and runs the kernels as an **in-process
+ttnn op**; ttnn's program cache compiles the program once per resolution and
+keeps it warm, so per-frame cost is the on-device **kernel** plus host work —
+the CPU project/tile/sort stages and packing inputs to / unpacking the image
+from the device. (The previous design shuttled each frame to a daemon
+subprocess over shared memory; that whole IPC layer is gone.) All optimizations
+below preserve the image to ~41 dB PSNR vs the CPU reference.
 
 ### End-to-end (real scenes, 640×640, full pipeline, TT backend)
 
-| Scene | Gaussians | Frame time | |
+| Scene | Gaussians (visible) | Frame time | |
 |---|--:|--:|--:|
-| luigi.ply | 14.5K | ~30 ms | ~33 fps |
-| point_cloud.ply (Mip-NeRF 360) | 742K | ~315 ms | ~3 fps |
+| luigi.ply | 14.5K | ~28 ms | ~36 fps |
+| train.ply | 608K | ~308 ms | ~3 fps |
 
-The CPU reference renders the same scenes at seconds-to-minutes per frame
-(its alpha-blend alone is ~3.5 s on luigi). On the 742K scene the device
-kernel is ~130 ms; the rest is host CPU stages.
+The CPU reference renders the same scenes at seconds-to-minutes per frame (its
+alpha-blend alone is ~3.5 s on luigi). The pipeline is **device-bound** on big
+scenes — the kernel is ~130 ms on `train.ply`; the rest is shared CPU stages.
+Where a single frame's ~28 ms goes on luigi 640: device kernel ~9 ms, CPU
+project/tile/sort ~9 ms, host pack/upload/readback ~3 ms, the remainder
+dispatch + sync overhead.
 
-### Host ↔ device data path
+### Host data path
 
-The daemon receives each frame's inputs and returns the rendered image. The
-hand-off and the entry sort were the bulk of a real frame; the wins, measured
-on the synthetic 640×640 / 10K-Gaussian blend round-trip unless noted:
+With no daemon, "host↔device" is now just `ttnn.from_torch` uploads and one
+`ttnn.to_torch` readback per frame. The optimizations that matter:
 
-| Change | round-trip | |
-|---|--:|---|
-| Baseline — `.npy` files on disk-backed `/tmp` | 77 ms | 1.0× |
-| Stage `.npy` on tmpfs (`/dev/shm`) | 54 ms | 1.4× |
-| Zero-copy shared-memory hand-off (`MFRAME`, mmap, no `.npy`) | 27 ms | 2.9× |
-| Keep static px/py grids resident on-device (`SETGRID`) | 26 ms | 3.0× |
-
-- **Zero-copy `MFRAME`** maps one `/dev/shm` region into both host and daemon.
-  Each frame the host writes the per-frame buffers — the 64-byte scalar packs and
-  per-tile offsets — straight into it in device-ready form; the daemon uploads
-  them to DRAM and reads the result back via pointer, with no `.npy`
-  serialize/parse and no fp32↔bf16 conversion. The `.npy` `FRAME` path is kept as
-  a fallback (and for the test suite).
-- **Resident px/py grids (`SETGRID`)** — the per-pixel coordinate grids don't
-  change at a fixed resolution, so they aren't shipped per frame: they're
-  uploaded once (first frame / on resolution change) into DRAM buffers the daemon
-  keeps resident and reuses for every subsequent `MFRAME`.
-- **4 KB scalar-packs DRAM page** — paging the packs buffer at 4 KB (64 packs/
-  page) instead of 64 B lifts host→DRAM upload from ~1.6 GB/s to ~40 GB/s; it
-  was page-count bound (~235K tiny pages).
-- **Integer-key sort** — the entry sort (largest CPU stage on big scenes) moved
-  from a float64 `argsort` to a `torch.sort` over an integer `(tile_id<<32 |
-  depth_bits)` key: **104 → 18 ms** on the 742K scene (~6×).
+- **Resident px/py grids** — the per-pixel coordinate grids depend only on
+  resolution, so they're uploaded once per `(H, W)` and kept as device tensors,
+  not re-shipped each frame (the in-process equivalent of the old `SETGRID`).
+- **4 KB scalar-packs DRAM page** — the packs tensor is shaped so its ttnn
+  interleaved-DRAM page is 4 KB (64 packs/page) rather than 64 B, lifting
+  host→DRAM upload from ~1.6 GB/s to ~40 GB/s (it was page-count bound). The op
+  validates these page sizes match the kernels at dispatch.
+- **Reusable packs scratch** — the page-padded packs buffer is built into a
+  persistent host scratch (only the `<64`-row tail re-zeroed per frame) instead
+  of a fresh zero-allocation: **~43 → ~10 ms** of per-frame host work on
+  `train.ply`.
+- **bf16 readback + transpose** — the tile-major→`(H, W, 3)` conversion runs in
+  torch on bf16 (then a single widen to fp32 on the cropped result), **~7 → ~0.5
+  ms** vs the old numpy fp32 transpose.
+- **Integer-key sort** — the entry sort (largest CPU stage on big scenes) uses a
+  `torch.sort` over an integer `(tile_id<<32 | depth_bits)` key instead of a
+  float64 `argsort`: **104 → 18 ms** on a ~740K scene (~6×).
 
 ### Kernel side
 
@@ -192,8 +199,10 @@ source venv/bin/activate
 pytest tests/
 ```
 
-`test_numeric_sanity.py` runs anywhere; the three `test_kernel_integration.py`
-tests need a Tenstorrent device.
+`test_numeric_sanity.py` and `test_lpt.py` run anywhere; the device tests
+(`test_kernel_integration.py` — PSNR, empty-tile, perf — and
+`test_ttnn_op_cache.py` — program-cache warm-frame invariant) skip cleanly
+without a Tenstorrent device.
 
 ## References
 

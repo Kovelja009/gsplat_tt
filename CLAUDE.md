@@ -55,12 +55,22 @@ load_ply → project_gaussians → get_tile_assignments → sort_and_bin
                                                                   │
                                                                   ↓
                                                       backends.tt.backend.KernelBackend
+                                                       (in-process: ttnn.open_device once,
+                                                        ttnn.experimental.gaussian_alpha_blend
+                                                        per frame — no daemon/IPC)
                                                                   ↓
                                                           tt-metal kernels:
                                                               reader (NCRISC) →
                                                               compute (TRISCs) →
                                                               writer (BRISC)
 ```
+
+The kernels live in the ttnn op at
+`backends/tt/tt-metal/ttnn/cpp/ttnn/operations/experimental/gaussian_splatting/alpha_blend/`
+(device/kernels/). The op's program factory ports the old daemon host
+orchestration; the per-frame LPT tile→core schedule (`backends/tt/lpt.py`) is
+passed as hash-excluded op attributes so ttnn's program cache keeps kernels warm
+(one compiled program per resolution).
 
 The kernel side splits into 3 RISC kernels per Tensix core:
 - **Reader** (NCRISC, NoC1): DRAM → L1 via circular buffers.
@@ -83,17 +93,19 @@ Key tt-metal constants we use:
 
 ## Project venv
 
-The host-side Python (viewer, CPU pipeline, tests, kernel-backend wrapper)
-lives in `./venv`:
+Everything (viewer, CPU pipeline, tests, the TT backend, AND `ttnn`) runs in
+one environment, `./venv`:
 - Activate: `source venv/bin/activate`
-- Used by: `gsplat ...`, `pytest`, anything in `gsplat/` or `tests/`.
+- Used by: `gsplat ...`, `pytest`, anything in `gsplat/`, `tests/`, `backends/`.
 
-Note: tt-metal's `ttnn` Python bindings (and the separate `python_env` they
-need) are intentionally **not built** by setup. Our runtime only invokes
-the C++ binary as a subprocess, so we pass `--without-python-bindings` to
-`build_metal.sh` and skip `create_venv.sh`. If you ever need `ttnn`
-directly, run tt-metal's `create_venv.sh` manually inside
-`backends/tt/tt-metal/`.
+The TT backend drives the device **in-process** via a custom ttnn op
+(`ttnn.experimental.gaussian_alpha_blend`), so `ttnn` IS built and installed
+into `./venv` (`setup.sh` runs `build_metal.sh` WITHOUT
+`--without-python-bindings`, then `pip install -e backends/tt/tt-metal`).
+tt-metal's `create_venv.sh` / `python_env` is intentionally NOT used — one
+interpreter runs everything. Note `numpy` is pinned `<2` because ttnn requires
+it. There is no longer a daemon subprocess. See
+`docs/superpowers/specs/2026-06-07-in-process-ttnn-op-backend-design.md`.
 
 ## Setup
 
@@ -103,23 +115,27 @@ directly, run tt-metal's `create_venv.sh` manually inside
 2. Vendors `tenstorrent/tt-metal` into `backends/tt/tt-metal/` (~5 GB; the
    target dir already contains our tracked kernel subdir, so the script
    clones to a temp location and merges with `cp -rn`).
-3. Adds `add_subdirectory(gaussian_splatting)` to tt-metal's
-   `programming_examples/CMakeLists.txt`.
-4. `sudo ./build_metal.sh --build-programming-examples --without-python-bindings`
-   to compile the C++ libs + our kernel host binary. `sudo` needed for
+3. Injects build wiring for our ttnn op into untracked upstream files
+   (`ttnn/CMakeLists.txt` add_subdirectory + link lib, `ttnn/sources.cmake`
+   nanobind source, `experimental_nanobind.cpp` include + bind call) —
+   idempotent, re-applied on every (re)vendor. Only our op subtree is tracked.
+4. `sudo ./build_metal.sh --build-programming-examples` (Python bindings ON)
+   to compile the C++ libs + the ttnn op into `_ttnn.so`, then
+   `pip install -e backends/tt/tt-metal` into `./venv`. `sudo` needed for
    tt-metal's root-owned SFPI / CPM caches.
 
 Pin a tt-metal version with `TT_METAL_REF=v1.2.3 ./setup.sh`.
 
-To rebuild only the kernel host binary after editing `alpha_blend.cpp` /
-`alpha_blend_compute.cpp` / kernel sources:
+To rebuild after editing the op host code or kernels
+(`gaussian_splatting/alpha_blend/...`):
 
 ```bash
-sudo ninja -C backends/tt/tt-metal/build metal_example_gaussian_splatting
+sudo ./backends/tt/tt-metal/build_metal.sh --build-programming-examples
 ```
 
-(The `.cpp` kernel sources in `kernels/` are JIT-compiled at runtime by
-tt-metal — only the host binary needs CMake rebuild.)
+This recompiles the op into `_ttnn.so` (editable install picks it up, no
+reinstall needed). The kernel `.cpp` sources under `device/kernels/` are
+JIT-compiled at runtime; the host `.cpp`/`.hpp` need the rebuild above.
 
 ## Running
 
@@ -145,12 +161,15 @@ source venv/bin/activate
 pytest tests/
 ```
 
-Three integration tests in `tests/test_kernel_integration.py`:
-- `test_full_scene_psnr` (64×64, 50 random Gaussians) — PSNR target ≥35 dB
-- `test_640_perf_baseline` (one-shot kernel binary, 640×640, 10K Gaussians)
-- `test_640_perf_daemon` (5-frame daemon-mode benchmark)
+Device tests (in-process, skip cleanly with no TT device) in
+`tests/test_kernel_integration.py`:
+- `test_full_scene_psnr` (64×64, 50 Gaussians) — PSNR ≥35 dB (~52 dB)
+- `test_sparse_scene_empty_tiles` (128×128, sparse) — empty-tile zeroing
+- `test_640_perf` (640×640, 10K Gaussians) — warm-frame median latency
 
-Plus `tests/test_numeric_sanity.py` — pure-Python alpha-blend reference checks.
+Plus `tests/test_ttnn_op_cache.py` (program-cache warm-frame invariant),
+`tests/test_lpt.py` (LPT scheduler), and `tests/test_numeric_sanity.py`
+(pure-Python alpha-blend reference checks).
 
 ## Resolved known issues (kept here for context)
 

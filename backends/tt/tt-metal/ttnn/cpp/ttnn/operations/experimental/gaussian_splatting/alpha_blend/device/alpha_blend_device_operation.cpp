@@ -37,12 +37,16 @@ void AlphaBlendDeviceOperation::validate_on_program_cache_miss(
 
 ttnn::TensorSpec AlphaBlendDeviceOperation::compute_output_specs(
     const operation_attributes_t& a, const tensor_args_t& t) {
-    // Output is tile-major: (num_tiles, 3 channels, 32, 32) bf16.
-    const ttnn::Shape out_shape({a.num_tiles, 3u, 32u, 32u});
+    // The writer emits 3 raw bf16 32x32 tiles (R,G,B) per screen tile to DRAM
+    // pages 3*tile+{0,1,2} with page size 2048 B. To make a ttnn ROW_MAJOR
+    // interleaved buffer page exactly one 32x32 bf16 tile (1024 elems * 2 B =
+    // 2048 B), the output is shaped (num_tiles*3, 1024): one page per row. The
+    // host reshapes (num_tiles*3,1024) -> (num_tiles,3,32,32) on readback.
+    const ttnn::Shape out_shape({a.num_tiles * 3u, 1024u});
     return TensorSpec(
         out_shape,
         tt::tt_metal::TensorLayout(
-            DataType::BFLOAT16, tt::tt_metal::PageConfig(Layout::TILE), t.packs.memory_config()));
+            DataType::BFLOAT16, tt::tt_metal::PageConfig(Layout::ROW_MAJOR), t.packs.memory_config()));
 }
 
 ttnn::Tensor AlphaBlendDeviceOperation::create_output_tensors(

@@ -4,6 +4,7 @@
 #include "alpha_blend_device_operation.hpp"
 
 #include "ttnn/tensor/tensor.hpp"
+#include "ttnn/types.hpp"                          // ttnn::DRAM_MEMORY_CONFIG
 #include "ttnn/device_operation.hpp"
 #include "ttnn/operations/creation/creation.hpp"  // ttnn::zeros
 
@@ -38,17 +39,20 @@ void AlphaBlendDeviceOperation::validate_on_program_cache_miss(
 }
 
 ttnn::TensorSpec AlphaBlendDeviceOperation::compute_output_specs(
-    const operation_attributes_t& a, const tensor_args_t& t) {
+    const operation_attributes_t& a, const tensor_args_t& /*t*/) {
     // The writer emits 3 raw bf16 32x32 tiles (R,G,B) per screen tile to DRAM
     // pages 3*tile+{0,1,2} with page size 2048 B. To make a ttnn ROW_MAJOR
     // interleaved buffer page exactly one 32x32 bf16 tile (1024 elems * 2 B =
     // 2048 B), the output is shaped (num_tiles*3, 1024): one page per row. The
     // host reshapes (num_tiles*3,1024) -> (num_tiles,3,32,32) on readback.
+    // Output placement is the op's own contract (interleaved DRAM), NOT inherited
+    // from an input's memory_config — the writer kernel assumes interleaved DRAM
+    // with 2048 B pages, so a sharded/L1 input must not silently change it.
     const ttnn::Shape out_shape({a.num_tiles * 3u, 1024u});
     return TensorSpec(
         out_shape,
         tt::tt_metal::TensorLayout(
-            DataType::BFLOAT16, tt::tt_metal::PageConfig(Layout::ROW_MAJOR), t.packs.memory_config()));
+            DataType::BFLOAT16, tt::tt_metal::PageConfig(Layout::ROW_MAJOR), ttnn::DRAM_MEMORY_CONFIG));
 }
 
 ttnn::Tensor AlphaBlendDeviceOperation::create_output_tensors(
@@ -58,7 +62,7 @@ ttnn::Tensor AlphaBlendDeviceOperation::create_output_tensors(
     // is correct for ANY caller, not just a host that masks empties afterward.
     const ttnn::Shape out_shape({a.num_tiles * 3u, 1024u});
     return ttnn::zeros(
-        out_shape, DataType::BFLOAT16, Layout::ROW_MAJOR, *t.packs.device(), t.packs.memory_config());
+        out_shape, DataType::BFLOAT16, Layout::ROW_MAJOR, *t.packs.device(), ttnn::DRAM_MEMORY_CONFIG);
 }
 
 }  // namespace ttnn::operations::experimental::gaussian_splatting::alpha_blend

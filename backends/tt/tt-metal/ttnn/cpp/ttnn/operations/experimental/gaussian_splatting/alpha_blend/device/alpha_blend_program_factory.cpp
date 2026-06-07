@@ -38,6 +38,46 @@ constexpr const char* kWriterKernel =
     "ttnn/cpp/ttnn/operations/experimental/gaussian_splatting/alpha_blend/device/kernels/dataflow/"
     "writer_alpha_blend.cpp";
 
+// The reader/writer kernels hardcode the DRAM page size they pass to
+// TensorAccessor. The host (backends/tt/backend.py) must shape the ttnn
+// input/output tensors so their interleaved-DRAM page size equals these EXACTLY,
+// or the kernels read/write misaligned DRAM. This is the single C++ statement of
+// that geometry contract; validate_page_sizes() enforces it at dispatch so a
+// mismatch fails loud instead of silently corrupting pixels / L1.
+constexpr uint32_t kPacksPageBytes   = 4096;  // 64 packs x 64-byte pack (reader: packs_dram_page_bytes)
+constexpr uint32_t kTilePageBytes    = 2048;  // one 32x32 bf16 tile (px/py and output)
+constexpr uint32_t kOffsetsPageBytes = 4;     // one u32 per page (reader: offsets page_size)
+constexpr uint32_t kTileIdsPageBytes = 64;    // 16 u32 per page (reader/writer: tile_ids_page_bytes)
+
+void validate_page_sizes(const AlphaBlendInputs& t, const ttnn::Tensor& out) {
+    auto pg = [](const ttnn::Tensor& x) { return static_cast<uint32_t>(x.buffer()->page_size()); };
+    TT_FATAL(pg(t.packs) == kPacksPageBytes,
+             "packs DRAM page size {} != kernel-expected {} (host tensor shaping drifted)", pg(t.packs), kPacksPageBytes);
+    TT_FATAL(pg(t.offsets) == kOffsetsPageBytes,
+             "offsets DRAM page size {} != kernel-expected {}", pg(t.offsets), kOffsetsPageBytes);
+    TT_FATAL(pg(t.px) == kTilePageBytes, "px DRAM page size {} != kernel-expected {}", pg(t.px), kTilePageBytes);
+    TT_FATAL(pg(t.py) == kTilePageBytes, "py DRAM page size {} != kernel-expected {}", pg(t.py), kTilePageBytes);
+    TT_FATAL(pg(t.tile_ids) == kTileIdsPageBytes,
+             "tile_ids DRAM page size {} != kernel-expected {}", pg(t.tile_ids), kTileIdsPageBytes);
+    TT_FATAL(pg(out) == kTilePageBytes, "output DRAM page size {} != kernel-expected {}", pg(out), kTilePageBytes);
+}
+
+// Per-core runtime args, in the exact order the kernels read them. Single source
+// of the layout so create_at (SetRuntimeArgs) and override_runtime_arguments
+// (patch GetRuntimeArgs) cannot drift out of sync.
+struct PerCoreArgs {
+    std::vector<uint32_t> reader, compute, writer;
+};
+PerCoreArgs build_core_args(
+    uint32_t packs, uint32_t offsets, uint32_t px, uint32_t py, uint32_t out, uint32_t tile_ids,
+    uint32_t start, uint32_t count) {
+    return PerCoreArgs{
+        {packs, offsets, px, py, tile_ids, start, count},
+        {count},
+        {out, tile_ids, start, count},
+    };
+}
+
 struct CreatedProgram {
     Program program;
     AlphaBlendProgramFactory::shared_variables_t shared_variables;
@@ -66,6 +106,9 @@ CreatedProgram create_at(
     const CoreCoord grid = device->compute_with_storage_grid_size();
     const CoreRangeSet all_cores(CoreRange({0, 0}, {grid.x - 1, grid.y - 1}));
 
+    // Enforce the host<->kernel DRAM page-size contract before building anything.
+    validate_page_sizes(t, out);
+
     // --- Circular buffers (verbatim from build_program_and_workload) ---------
     auto cb_tile = [&](uint32_t id, uint32_t depth) {
         CircularBufferConfig c(depth * TILE_BYTES_BF16, {{id, DataFormat::Float16_b}});
@@ -89,11 +132,7 @@ CreatedProgram create_at(
     cb_tile(CB_DX2, 2);
     cb_tile(CB_DY2, 2);
     cb_tile(CB_DXDY, 2);
-    {
-        CircularBufferConfig c(3 * TILE_BYTES_BF16, {{CB_Q, DataFormat::Float16_b}});
-        c.set_page_size(CB_Q, TILE_BYTES_BF16);
-        CreateCircularBuffer(program, all_cores, c);
-    }
+    cb_tile(CB_Q, 3);  // [a·dx², c·dy², 2b·dx·dy] — depth 3 (one batch in flight)
     cb_tile(CB_POWER, 2);
     cb_tile(CB_ALPHA, 2);
 
@@ -150,6 +189,10 @@ CreatedProgram create_at(
 
     // --- Per-core runtime args (port of set_per_core_runtime_args) ------------
     const auto cores = ordered_cores(all_cores);
+    TT_FATAL(
+        attrs.per_core_offset.size() == cores.size() && attrs.per_core_count.size() == cores.size(),
+        "LPT schedule length ({}) must equal the compute-grid core count ({})",
+        attrs.per_core_offset.size(), cores.size());
     const uint32_t packs_addr = static_cast<uint32_t>(t.packs.buffer()->address());
     const uint32_t offsets_addr = static_cast<uint32_t>(t.offsets.buffer()->address());
     const uint32_t px_addr = static_cast<uint32_t>(t.px.buffer()->address());
@@ -158,13 +201,11 @@ CreatedProgram create_at(
     const uint32_t tile_ids_addr = static_cast<uint32_t>(t.tile_ids.buffer()->address());
 
     for (size_t i = 0; i < cores.size(); i++) {
-        const CoreCoord& core = cores[i];
-        const uint32_t start = (i < attrs.per_core_offset.size()) ? attrs.per_core_offset[i] : 0;
-        const uint32_t count = (i < attrs.per_core_count.size()) ? attrs.per_core_count[i] : 0;
-        SetRuntimeArgs(program, reader, core,
-                       {packs_addr, offsets_addr, px_addr, py_addr, tile_ids_addr, start, count});
-        SetRuntimeArgs(program, compute, core, {count});
-        SetRuntimeArgs(program, writer, core, {out_addr, tile_ids_addr, start, count});
+        const auto a = build_core_args(packs_addr, offsets_addr, px_addr, py_addr, out_addr, tile_ids_addr,
+                                       attrs.per_core_offset[i], attrs.per_core_count[i]);
+        SetRuntimeArgs(program, reader, cores[i], a.reader);
+        SetRuntimeArgs(program, compute, cores[i], a.compute);
+        SetRuntimeArgs(program, writer, cores[i], a.writer);
     }
 
     return CreatedProgram{
@@ -204,30 +245,20 @@ void AlphaBlendProgramFactory::override_runtime_arguments(
 
     for (auto& [range, program] : cached_workload.workload.get_programs()) {
         const auto& svars = cached_workload.shared_variables.at(range);
+        TT_FATAL(
+            operation_attributes.per_core_offset.size() == svars.cores.size(),
+            "LPT schedule length ({}) must equal core count ({}) on cache hit",
+            operation_attributes.per_core_offset.size(), svars.cores.size());
         for (size_t i = 0; i < svars.cores.size(); i++) {
             const CoreCoord& core = svars.cores[i];
-            const uint32_t start =
-                (i < operation_attributes.per_core_offset.size()) ? operation_attributes.per_core_offset[i] : 0;
-            const uint32_t count =
-                (i < operation_attributes.per_core_count.size()) ? operation_attributes.per_core_count[i] : 0;
-
+            const auto a = build_core_args(packs_addr, offsets_addr, px_addr, py_addr, out_addr, tile_ids_addr,
+                                           operation_attributes.per_core_offset[i], operation_attributes.per_core_count[i]);
             auto& reader_args = GetRuntimeArgs(program, svars.reader_kernel_id, core);
-            reader_args[0] = packs_addr;
-            reader_args[1] = offsets_addr;
-            reader_args[2] = px_addr;
-            reader_args[3] = py_addr;
-            reader_args[4] = tile_ids_addr;
-            reader_args[5] = start;
-            reader_args[6] = count;
-
+            for (size_t k = 0; k < a.reader.size(); k++) reader_args[k] = a.reader[k];
             auto& compute_args = GetRuntimeArgs(program, svars.compute_kernel_id, core);
-            compute_args[0] = count;
-
+            compute_args[0] = a.compute[0];
             auto& writer_args = GetRuntimeArgs(program, svars.writer_kernel_id, core);
-            writer_args[0] = out_addr;
-            writer_args[1] = tile_ids_addr;
-            writer_args[2] = start;
-            writer_args[3] = count;
+            for (size_t k = 0; k < a.writer.size(); k++) writer_args[k] = a.writer[k];
         }
     }
 }

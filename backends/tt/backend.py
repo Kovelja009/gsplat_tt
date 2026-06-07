@@ -147,8 +147,12 @@ class KernelBackend(Backend):
             image = self._tiles_to_image(tiles, tiles_x, tiles_y, H, W)
             download_ms = (time.perf_counter() - t) * 1000.0
         except Exception as e:
-            # No daemon to isolate faults in-process; surface a clear error with
-            # context instead of a bare ttnn/device exception.
+            # nerfview cancels an in-flight render by raising InterruptRenderException
+            # from a trace hook at an arbitrary line — that's cooperative control
+            # flow, not a device fault, so let it (and KeyboardInterrupt) propagate
+            # untouched. Only wrap genuine errors with context.
+            if type(e).__name__ == "InterruptRenderException":
+                raise
             raise RuntimeError(
                 f"TT alpha_blend failed at {H}x{W} ({total_entries} entries, "
                 f"{num_tiles} tiles): {e}") from e

@@ -228,6 +228,21 @@ docs/thesis_plan.md
 /backends/tt/tt-metal/tt_metal/programming_examples/*
 !/backends/tt/tt-metal/tt_metal/programming_examples/gaussian_splatting
 
+# Our in-process ttnn op lives deep in the ttnn tree; track only that subtree.
+# (Upstream files we edit — ttnn/CMakeLists.txt, experimental_nanobind.cpp — are
+# NOT tracked; setup.sh re-injects those edits on a fresh vendor.)
+!/backends/tt/tt-metal/ttnn
+/backends/tt/tt-metal/ttnn/*
+!/backends/tt/tt-metal/ttnn/cpp
+/backends/tt/tt-metal/ttnn/cpp/*
+!/backends/tt/tt-metal/ttnn/cpp/ttnn
+/backends/tt/tt-metal/ttnn/cpp/ttnn/*
+!/backends/tt/tt-metal/ttnn/cpp/ttnn/operations
+/backends/tt/tt-metal/ttnn/cpp/ttnn/operations/*
+!/backends/tt/tt-metal/ttnn/cpp/ttnn/operations/experimental
+/backends/tt/tt-metal/ttnn/cpp/ttnn/operations/experimental/*
+!/backends/tt/tt-metal/ttnn/cpp/ttnn/operations/experimental/gaussian_splatting
+
 # Defensive: pre-reorg tt-metal location (in case anything ever re-clones there)
 /tt-metal/
 

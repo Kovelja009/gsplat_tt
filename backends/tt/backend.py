@@ -114,7 +114,14 @@ class KernelBackend(Backend):
         # --- readback (num_tiles*3, 1024) bf16 -> (H, W, 3) ---
         t = time.perf_counter()
         out_t = ttnn.to_torch(out).float().numpy()          # (num_tiles*3, 1024)
-        tiles = out_t.reshape(num_tiles, 3, 32, 32)
+        tiles = out_t.reshape(num_tiles, 3, 32, 32).copy()
+        # LPT skips empty tiles, so the writer never touches their output slots
+        # and the op-created tensor leaves them uninitialised. Zero them: an
+        # empty tile is one whose per-tile Gaussian count (offsets diff) is 0.
+        counts = offsets[1:num_tiles + 1].astype(np.int64) - offsets[:num_tiles].astype(np.int64)
+        empty = counts == 0
+        if empty.any():
+            tiles[empty] = 0.0
         image = self._tiles_to_image(tiles, tiles_x, tiles_y, H, W)
         download_ms = (time.perf_counter() - t) * 1000.0
 

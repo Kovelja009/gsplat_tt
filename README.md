@@ -86,6 +86,29 @@ For headless, repeatable benchmarking, `scripts/bench_scene.py` runs the full
 pipeline on a real `.ply` and prints the per-stage breakdown (pass `--cpu` to
 also compare against the CPU reference and print the PSNR).
 
+### Sweep harness (`benchmark/`)
+
+Sweep one backend across scenes × resolutions, then plot:
+
+```bash
+source venv/bin/activate
+# one backend per run (TT daemon / CUDA ext warmed once, held across the sweep):
+python -m benchmark.run tt   --res 256 480 640 960
+python -m benchmark.run cuda --res 256 480 640 960
+python -m benchmark.run cpu  --res 256 480 --skip-cpu-above 480   # CPU is slow on train.ply
+
+# per-backend graphs (one CSV) or cross-backend comparison (multiple):
+python -m benchmark.plot benchmark/results/tt.csv
+python -m benchmark.plot benchmark/results/cpu.csv benchmark/results/cuda.csv benchmark/results/tt.csv
+```
+
+Results land in `benchmark/results/` (gitignored): `<backend>.csv`, `.json`,
+and PNGs. Each blend timing is split into **load** (stage inputs) /
+**compute** (device kernel) / **return** (result to host) / **transfer**
+(residual host↔device movement); the four reconcile exactly to the blend
+wall time. The shared host pre-stages (project / tile_assign / sort) are
+reported separately.
+
 ## Setup details
 
 `./setup.sh` is idempotent and does:

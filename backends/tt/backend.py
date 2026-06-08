@@ -19,6 +19,7 @@ The op's output is (num_tiles*3, 1024) bf16 (page 2048); we reshape it back to
 """
 from __future__ import annotations
 
+import os
 import time
 
 import numpy as np
@@ -28,6 +29,7 @@ import ttnn
 from gsplat.backend import Backend
 from gsplat.rasterization import prepare_kernel_inputs
 from backends.tt.lpt import build_tile_assignment
+from backends.tt.segments import build_segmented_assignment
 
 PACK_FLOATS = 16                      # 9 used + 7 zero-pad (64-byte SCALAR_PACK_PAGE)
 PACKS_PER_PAGE = 64                   # 4096 / 64
@@ -67,6 +69,10 @@ class KernelBackend(Backend):
         # max entry count seen. Avoids a per-frame np.zeros of the whole buffer
         # (the pad columns [9:16] stay zero once allocated).
         self._packs_scratch: np.ndarray | None = None
+        # Intra-tile parallelism: when the segmented schedule splits a heavy tile
+        # across cores, render via the two-phase partial+combine ops. On by
+        # default; GSPLAT_TT_SPLIT=0 forces the legacy single-op path always.
+        self._split_enabled = os.environ.get("GSPLAT_TT_SPLIT", "1") != "0"
 
     def _resident_grids(self, H, W, px, py, num_tiles):
         """Upload (once per resolution) and return the resident px/py device tensors."""
@@ -83,6 +89,94 @@ class KernelBackend(Backend):
             g = (px_dev, py_dev)
             self._grids[key] = g
         return g
+
+    def _packs_page(self, packs, total_entries):
+        """Pad the packs SoA to the 4 KB DRAM page geometry the reader expects;
+        returns an (npages, PACK_PAGE_F32) f32 view of the reusable scratch."""
+        npages = max(1, (total_entries + PACKS_PER_PAGE - 1) // PACKS_PER_PAGE)
+        rows = npages * PACKS_PER_PAGE
+        sc = self._packs_scratch
+        if sc is None or sc.shape[0] < rows:
+            # New buffer is fully zeroed, so the pad columns [9:16] are 0.
+            sc = np.zeros((rows, PACK_FLOATS), dtype=np.float32)
+            self._packs_scratch = sc
+        nused = packs.shape[1]
+        sc[:total_entries, :nused] = packs          # overwrite used columns
+        sc[total_entries:rows, :nused] = 0.0        # zero the <64-row tail padding
+        return sc[:rows].reshape(npages, PACK_PAGE_F32)
+
+    def _blend_two_phase(self, H, W, tiles_x, tiles_y, num_tiles, packs_page, px, py, sched, prep_ms):
+        """Intra-tile parallel render: partial op composites depth-segments into
+        (R,G,B,T) partials; combine op merges them per tile via the associative
+        `over` operator. Used when the schedule splits a heavy tile across cores."""
+        dev = self.device
+        mc, rm = ttnn.DRAM_MEMORY_CONFIG, ttnn.ROW_MAJOR_LAYOUT
+
+        # Per-core caps: the partial writer caches partial_slots and the combine
+        # writer caches out_tiles in fixed L1 arrays (MAX_TILE_IDS_PER_CORE).
+        if int(sched.per_core_count.max()) > MAX_TILE_IDS_PER_CORE:
+            raise RuntimeError(
+                f"per-core job count {int(sched.per_core_count.max())} exceeds the kernel "
+                f"cap {MAX_TILE_IDS_PER_CORE} at {H}x{W}; lower resolution or raise the cap.")
+
+        # --- combine plan: pad to 4 cols, distribute rows contiguously across cores ---
+        plan = sched.combine_plan
+        nplan = plan.shape[0]
+        plan4 = np.zeros((nplan, 4), dtype=np.uint32)
+        plan4[:, :3] = plan
+        nc = self.num_cores
+        base, rem = divmod(nplan, nc)
+        cpo = np.zeros(nc, dtype=np.uint32)
+        cpc = np.zeros(nc, dtype=np.uint32)
+        off = 0
+        for c in range(nc):
+            cnt = base + (1 if c < rem else 0)
+            cpo[c] = off
+            cpc[c] = cnt
+            off += cnt
+
+        # --- upload ---
+        t = time.perf_counter()
+        px_dev, py_dev = self._resident_grids(H, W, px, py, num_tiles)
+        packs_dev = ttnn.from_torch(torch.from_numpy(packs_page), dtype=ttnn.float32, layout=rm, device=dev, memory_config=mc)
+        job_dev = ttnn.from_torch(_u32_tensor(sched.job_table.reshape(-1, 4)), dtype=ttnn.uint32, layout=rm, device=dev, memory_config=mc)
+        plan_dev = ttnn.from_torch(_u32_tensor(plan4), dtype=ttnn.uint32, layout=rm, device=dev, memory_config=mc)
+        ttnn.synchronize_device(dev)
+        upload_ms = (time.perf_counter() - t) * 1000.0
+
+        # --- phase 1: partial composite (each core does its segment-jobs) ---
+        t = time.perf_counter()
+        partials = ttnn.experimental.gaussian_alpha_blend_partial(
+            packs_dev, px_dev, py_dev, job_dev,
+            image_height=H, image_width=W, num_tiles=num_tiles, num_jobs=sched.num_jobs,
+            per_core_offset=[int(x) for x in sched.per_core_offset],
+            per_core_count=[int(x) for x in sched.per_core_count])
+        ttnn.synchronize_device(dev)
+        partial_ms = (time.perf_counter() - t) * 1000.0
+
+        # --- phase 2: combine (associative over-merge per tile) ---
+        t = time.perf_counter()
+        out = ttnn.experimental.gaussian_alpha_blend_combine(
+            partials, plan_dev, num_tiles=num_tiles,
+            per_core_offset=[int(x) for x in cpo], per_core_count=[int(x) for x in cpc])
+        ttnn.synchronize_device(dev)
+        combine_ms = (time.perf_counter() - t) * 1000.0
+
+        # --- readback ---
+        t = time.perf_counter()
+        out_t = ttnn.to_torch(out)
+        readback_ms = (time.perf_counter() - t) * 1000.0
+        t2 = time.perf_counter()
+        image = self._tiles_to_image(out_t, tiles_x, tiles_y, H, W)
+        unpack_ms = (time.perf_counter() - t2) * 1000.0
+
+        return image, {
+            "prep": prep_ms, "upload": upload_ms,
+            "partial_kernel": partial_ms, "combine_kernel": combine_ms,
+            "kernel": partial_ms + combine_ms,           # device compute (both phases)
+            "download": readback_ms + unpack_ms,
+            "readback": readback_ms, "unpack": unpack_ms,
+        }
 
     def blend(self, means_2d, covs_2d, colors, opacities,
               sorted_gaussian_ids, tile_ranges, image_height, image_width):
@@ -101,6 +195,17 @@ class KernelBackend(Backend):
         offsets = np.ascontiguousarray(offsets).astype(np.uint32).reshape(-1)
         prep_ms = (time.perf_counter() - t) * 1000.0
 
+        # --- Intra-tile parallelism: if the segmented schedule splits a heavy
+        # tile across cores, render via the two-phase partial+combine path.
+        # combine_plan has one row per non-empty tile, so num_jobs > its length
+        # iff at least one tile was split. ---
+        if self._split_enabled:
+            sched = build_segmented_assignment(offsets, num_tiles, self.num_cores)
+            if sched.num_jobs > sched.combine_plan.shape[0]:
+                packs_page = self._packs_page(packs, total_entries)
+                return self._blend_two_phase(
+                    H, W, tiles_x, tiles_y, num_tiles, packs_page, px, py, sched, prep_ms)
+
         # --- LPT schedule (host) ---
         per_core_offset, per_core_count, tile_ids = build_tile_assignment(
             offsets, num_tiles, self.num_cores)
@@ -115,18 +220,7 @@ class KernelBackend(Backend):
         try:
             # --- build page-matching host arrays (per-frame: packs/offsets/tile_ids) ---
             t = time.perf_counter()
-            npages = max(1, (total_entries + PACKS_PER_PAGE - 1) // PACKS_PER_PAGE)
-            rows = npages * PACKS_PER_PAGE
-            sc = self._packs_scratch
-            if sc is None or sc.shape[0] < rows:
-                # New buffer is fully zeroed, so the pad columns [9:16] are 0.
-                sc = np.zeros((rows, PACK_FLOATS), dtype=np.float32)
-                self._packs_scratch = sc
-            nused = packs.shape[1]
-            sc[:total_entries, :nused] = packs          # overwrite used columns
-            sc[total_entries:rows, :nused] = 0.0        # zero the <64-row tail padding
-            # (pad columns [nused:] were zeroed at allocation and never written)
-            packs_page = sc[:rows].reshape(npages, PACK_PAGE_F32)
+            packs_page = self._packs_page(packs, total_entries)
 
             offsets_col = offsets.reshape(-1, 1)
 

@@ -34,6 +34,7 @@ constexpr const char* kWriterKernel =
 // CB indices — must match the combine kernels.
 constexpr uint32_t CB_PARTIAL  = 0;   // bf16 partial tiles (R,G,B,T per job)
 constexpr uint32_t CB_META     = 1;   // one uint32 (K) per output tile
+constexpr uint32_t CB_PROD     = 15;  // fp32 scratch: T_acc * C_i (and T_acc * T_i)
 constexpr uint32_t CB_COLOR_OUT = 16; // R,G,B output tiles
 constexpr uint32_t CB_C_R      = 17;  // fp32 running color accumulators
 constexpr uint32_t CB_C_G      = 18;
@@ -97,13 +98,18 @@ CreatedProgram create_at(const CombineParams& attrs, const CombineInputs& t, ttn
         c.set_page_size(id, page);
         CreateCircularBuffer(program, all_cores, c);
     };
+    // All bf16 (matching the single-phase kernel): eltwise binary ops mix
+    // operands poorly across formats, and fp32_dest_acc_en keeps the in-Dst
+    // math fp32 regardless of CB storage format. Only the inter-op spills are
+    // bf16, which is fine — the partials are already bf16.
     cb_tile(CB_PARTIAL, 8, DataFormat::Float16_b, TILE_BYTES_BF16);
     cb_tile(CB_META, 2, DataFormat::UInt32, META_PAGE_BYTES);
+    cb_tile(CB_PROD, 2, DataFormat::Float16_b, TILE_BYTES_BF16);
     cb_tile(CB_COLOR_OUT, 3, DataFormat::Float16_b, TILE_BYTES_BF16);
-    cb_tile(CB_C_R, 1, DataFormat::Float32, TILE_BYTES_FP32);
-    cb_tile(CB_C_G, 1, DataFormat::Float32, TILE_BYTES_FP32);
-    cb_tile(CB_C_B, 1, DataFormat::Float32, TILE_BYTES_FP32);
-    cb_tile(CB_T_ACC, 1, DataFormat::Float32, TILE_BYTES_FP32);
+    cb_tile(CB_C_R, 1, DataFormat::Float16_b, TILE_BYTES_BF16);
+    cb_tile(CB_C_G, 1, DataFormat::Float16_b, TILE_BYTES_BF16);
+    cb_tile(CB_C_B, 1, DataFormat::Float16_b, TILE_BYTES_BF16);
+    cb_tile(CB_T_ACC, 1, DataFormat::Float16_b, TILE_BYTES_BF16);
 
     std::vector<uint32_t> reader_ct;
     TensorAccessorArgs(t.partials.buffer()).append_to(reader_ct);

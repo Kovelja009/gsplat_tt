@@ -18,6 +18,27 @@ import heapq
 import numpy as np
 
 
+def greedy_lpt(item_weights, num_cores):
+    """Greedy longest-processing-time bin-packing.
+
+    Assigns each `(item_id, weight)` to the currently least-loaded of `num_cores`
+    bins, heaviest item first, to minimise the maximum per-bin total. Returns
+    `num_cores` buckets, each a list of `item_id`s. Tie-breaks are deterministic:
+    equal weights keep input order (stable sort); equal bin loads pick the lowest
+    bin index (heap order). Shared by the single-op (`build_tile_assignment`) and
+    two-phase (`segments.build_segmented_assignment`) schedulers.
+    """
+    order = sorted(item_weights, key=lambda iw: iw[1], reverse=True)
+    buckets: list[list[int]] = [[] for _ in range(num_cores)]
+    heap = [(0, c) for c in range(num_cores)]  # (current_load, core)
+    heapq.heapify(heap)
+    for item_id, w in order:
+        cur, c = heapq.heappop(heap)
+        buckets[c].append(item_id)
+        heapq.heappush(heap, (cur + int(w), c))
+    return buckets
+
+
 def build_tile_assignment(offsets: np.ndarray, num_tiles: int, num_cores: int):
     """Greedy-LPT tile->core assignment.
 
@@ -35,17 +56,10 @@ def build_tile_assignment(offsets: np.ndarray, num_tiles: int, num_cores: int):
     offsets = np.asarray(offsets, dtype=np.int64)
     loads = offsets[1:num_tiles + 1] - offsets[:num_tiles]
 
-    # Heaviest tiles first; empty tiles dropped.
-    nonempty = [t for t in range(num_tiles) if loads[t] > 0]
-    nonempty.sort(key=lambda t: int(loads[t]), reverse=True)
-
-    buckets: list[list[int]] = [[] for _ in range(num_cores)]
-    heap = [(0, c) for c in range(num_cores)]  # (current_load, core)
-    heapq.heapify(heap)
-    for t in nonempty:
-        cur, c = heapq.heappop(heap)
-        buckets[c].append(t)
-        heapq.heappush(heap, (cur + int(loads[t]), c))
+    # LPT over non-empty tiles (empty tiles dropped — the kernel never writes
+    # their output slots, which stay zero/background).
+    items = [(t, int(loads[t])) for t in range(num_tiles) if loads[t] > 0]
+    buckets = greedy_lpt(items, num_cores)
 
     per_core_offset = np.zeros(num_cores, dtype=np.uint32)
     per_core_count = np.zeros(num_cores, dtype=np.uint32)

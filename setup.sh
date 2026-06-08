@@ -89,75 +89,67 @@ fi
 # (The old standalone daemon programming-example is gone; the kernels now live
 # in the ttnn op below. Nothing to register under programming_examples.)
 
-# ----- 3b. Register the in-process ttnn op (alpha_blend) in the ttnn build ---
-# Our op subtree under ttnn/cpp/.../experimental/gaussian_splatting/ is tracked
-# by git, but the upstream files that REFERENCE it (ttnn/CMakeLists.txt and
-# experimental_nanobind.cpp) are not — so re-inject those edits idempotently on
-# every (re)vendor, mirroring the programming-examples registration above.
+# ----- 3b. Register our in-process ttnn ops in the ttnn build ---------------
+# Our op subtrees under ttnn/cpp/.../experimental/gaussian_splatting/ are tracked
+# by git, but the upstream files that REFERENCE them (ttnn/CMakeLists.txt,
+# ttnn/sources.cmake, experimental_nanobind.cpp) are NOT — so re-inject those
+# edits idempotently on every (re)vendor. One driver registers all three ops
+# (alpha_blend single-op + alpha_blend_partial/combine for intra-tile parallelism),
+# chaining each after the previous so insertion order is stable.
 TTNN_CMAKE="$TT_METAL_DIR/ttnn/CMakeLists.txt"
-EXP_NB="$TT_METAL_DIR/ttnn/cpp/ttnn/operations/experimental/experimental_nanobind.cpp"
-OP_SUBDIR="cpp/ttnn/operations/experimental/gaussian_splatting/alpha_blend"
-OP_LINK="TTNN::Ops::Experimental::GaussianSplatting::AlphaBlend"
-if [ -f "$TTNN_CMAKE" ]; then
-    if ! grep -qF "add_subdirectory($OP_SUBDIR)" "$TTNN_CMAKE"; then
-        say "Registering alpha_blend op add_subdirectory in $TTNN_CMAKE"
-        # Insert right after the post_combine_reduce add_subdirectory line.
-        python3 - "$TTNN_CMAKE" "$OP_SUBDIR" <<'PY'
-import sys
-path, subdir = sys.argv[1], sys.argv[2]
-s = open(path).read()
-anchor = "add_subdirectory(cpp/ttnn/operations/experimental/deepseek_prefill/post_combine_reduce)\n"
-ins = f"add_subdirectory({subdir})\n"
-s = s.replace(anchor, anchor + ins, 1) if anchor in s else s + "\n" + ins
-open(path, "w").write(s)
-PY
-    fi
-    if ! grep -qF "$OP_LINK" "$TTNN_CMAKE"; then
-        say "Linking $OP_LINK into the ttnn target"
-        python3 - "$TTNN_CMAKE" "$OP_LINK" <<'PY'
-import sys
-path, lib = sys.argv[1], sys.argv[2]
-s = open(path).read()
-anchor = "        TTNN::Ops::Experimental::DeepSeekPrefill::PostCombineReduce\n"
-ins = f"        {lib}\n"
-s = s.replace(anchor, anchor + ins, 1) if anchor in s else s
-open(path, "w").write(s)
-PY
-    fi
-fi
-# The op's nanobind .cpp is compiled into the ttnn python module via the
-# aggregated nanobind source list in ttnn/sources.cmake.
 TTNN_SRCS="$TT_METAL_DIR/ttnn/sources.cmake"
-OP_NB_SRC="cpp/ttnn/operations/experimental/gaussian_splatting/alpha_blend/alpha_blend_nanobind.cpp"
-if [ -f "$TTNN_SRCS" ] && ! grep -qF "$OP_NB_SRC" "$TTNN_SRCS"; then
-    say "Registering alpha_blend nanobind source in $TTNN_SRCS"
-    python3 - "$TTNN_SRCS" "$OP_NB_SRC" <<'PY'
-import sys
-path, src = sys.argv[1], sys.argv[2]
-s = open(path).read()
-anchor = "    cpp/ttnn/operations/experimental/deepseek_prefill/post_combine_reduce/post_combine_reduce_nanobind.cpp\n"
-ins = f"    {src}\n"
-s = s.replace(anchor, anchor + ins, 1) if anchor in s else s
-open(path, "w").write(s)
+EXP_NB="$TT_METAL_DIR/ttnn/cpp/ttnn/operations/experimental/experimental_nanobind.cpp"
+say "Registering gaussian_splatting ttnn ops (alpha_blend, alpha_blend_combine, alpha_blend_partial) in the ttnn build"
+python3 - "$TTNN_CMAKE" "$TTNN_SRCS" "$EXP_NB" <<'PY'
+import os, sys
+cmake, srcs, exp_nb = sys.argv[1], sys.argv[2], sys.argv[3]
+
+# Ordered so each op chains after the previous (stable, matches the live tree).
+OPS = ["alpha_blend", "alpha_blend_combine", "alpha_blend_partial"]
+def pascal(op): return "".join(w.capitalize() for w in op.split("_"))
+
+def insert_chain(s, base_anchor, lines):
+    """Idempotently insert each line after the running anchor (starting at
+    base_anchor); already-present lines are skipped but still advance the anchor.
+    A missing anchor is a loud failure rather than a silently-broken file."""
+    prev = base_anchor
+    for line in lines:
+        if line in s:
+            prev = line
+            continue
+        if prev not in s:
+            raise SystemExit(f"setup.sh: ttnn-op injection anchor not found:\n  {prev!r}")
+        s = s.replace(prev, prev + line, 1)
+        prev = line
+    return s
+
+if os.path.isfile(cmake):
+    s = open(cmake).read()
+    s = insert_chain(
+        s, "add_subdirectory(cpp/ttnn/operations/experimental/deepseek_prefill/post_combine_reduce)\n",
+        [f"add_subdirectory(cpp/ttnn/operations/experimental/gaussian_splatting/{op})\n" for op in OPS])
+    s = insert_chain(
+        s, "        TTNN::Ops::Experimental::DeepSeekPrefill::PostCombineReduce\n",
+        [f"        TTNN::Ops::Experimental::GaussianSplatting::{pascal(op)}\n" for op in OPS])
+    open(cmake, "w").write(s)
+
+if os.path.isfile(srcs):
+    s = open(srcs).read()
+    s = insert_chain(
+        s, "    cpp/ttnn/operations/experimental/deepseek_prefill/post_combine_reduce/post_combine_reduce_nanobind.cpp\n",
+        [f"    cpp/ttnn/operations/experimental/gaussian_splatting/{op}/{op}_nanobind.cpp\n" for op in OPS])
+    open(srcs, "w").write(s)
+
+if os.path.isfile(exp_nb):
+    s = open(exp_nb).read()
+    s = insert_chain(
+        s, '#include "ttnn/operations/experimental/deepseek_prefill/post_combine_reduce/post_combine_reduce_nanobind.hpp"\n',
+        [f'#include "ttnn/operations/experimental/gaussian_splatting/{op}/{op}_nanobind.hpp"\n' for op in OPS])
+    s = insert_chain(
+        s, "    deepseek_prefill::detail::bind_post_combine_reduce(mod);\n",
+        [f"    gaussian_splatting::{op}::detail::bind_gaussian_{op}(mod);\n" for op in OPS])
+    open(exp_nb, "w").write(s)
 PY
-fi
-if [ -f "$EXP_NB" ] && ! grep -qF "gaussian_splatting/alpha_blend/alpha_blend_nanobind.hpp" "$EXP_NB"; then
-    say "Wiring alpha_blend nanobind into $EXP_NB"
-    python3 - "$EXP_NB" <<'PY'
-import sys
-path = sys.argv[1]
-s = open(path).read()
-inc_anchor = '#include "ttnn/operations/experimental/deepseek_prefill/post_combine_reduce/post_combine_reduce_nanobind.hpp"\n'
-inc = '#include "ttnn/operations/experimental/gaussian_splatting/alpha_blend/alpha_blend_nanobind.hpp"\n'
-if inc_anchor in s:
-    s = s.replace(inc_anchor, inc_anchor + inc, 1)
-call_anchor = '    deepseek_prefill::detail::bind_post_combine_reduce(mod);\n'
-call = '    gaussian_splatting::alpha_blend::detail::bind_gaussian_alpha_blend(mod);\n'
-if call_anchor in s:
-    s = s.replace(call_anchor, call_anchor + call, 1)
-open(path, "w").write(s)
-PY
-fi
 
 # ----- 4. Build tt-metal + ttnn (incl. our op) ------------------------------
 # We no longer pass --without-python-bindings, so build_metal.sh builds the

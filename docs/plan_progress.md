@@ -348,3 +348,37 @@ sanitizers off keeps perturbation low enough to still trigger races.
 2. User reviews and approves spec
 3. Transition to writing-plans skill for implementation plan
 4. Implement kernel in `tt_metal_kernels/alpha_blend/` (dir TBD)
+
+---
+
+## Intra-tile parallelism (depth-segment + associative combine) — 2026-06-08
+
+**Problem:** the alpha-blend kernel is *densest-tile-bound* — wall-clock ∝ the
+single densest tile's Gaussian count (a tile is the atomic unit of work; one
+core processes all its Gaussians). For `train.ply` the densest tile holds ~63K
+low-α Gaussians, so `train@256` compute was 345 ms (and, perversely, *faster* at
+higher res as the dense region subdivided into more tiles). Early-out doesn't
+help (dense low-α tiles never fully saturate); the work is genuine.
+
+**Fix:** split a heavy tile's depth-sorted Gaussians into K contiguous segments,
+composite each into a partial `(R,G,B,T)` on its own core (`gaussian_alpha_blend_partial`),
+then merge in depth order via the associative Porter-Duff `over` operator
+(`gaussian_alpha_blend_combine`). Two new ttnn ops; the single-phase op is
+untouched and still used when no tile splits. Host scheduler
+`build_segmented_assignment` (in `backends/tt/segments.py`) splits tiles past the
+`entries/cores` ideal and LPT-balances the segment-jobs. Backend auto-selects the
+two-phase path when a split occurs (`GSPLAT_TT_SPLIT=0` forces the legacy path).
+
+**Result (train.ply, Blackhole 130 cores, compute ms):**
+
+| res | single-op | two-phase | speedup |
+|-----|----------:|----------:|--------:|
+| 256 | 344.7 | 40.6 | **8.5×** |
+| 480 | 188.5 | 44.0 | 4.3× |
+| 640 | 130.1 | 45.8 | 2.8× |
+| 960 |  72.6 | 55.3 | 1.3× |
+
+`train@256` end-to-end 485→186 ms (2.1→5.4 fps); compute is now ~flat across
+resolution (the inversion is gone). `luigi` (no heavy tiles) is unaffected.
+Correctness validated on-device: K=1 combine == partial RGB exactly; K>1 splits
+45–47 dB vs the CPU reference (≈ the single-phase op's ~41–51 dB).

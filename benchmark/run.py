@@ -41,12 +41,16 @@ def _snap32(res: int) -> int:
     return max(32, (res // 32) * 32)
 
 
-def _measure_cell(pipeline, gaussians, extr, intr, H, W, warmup, measure):
-    """Run warmup+measure renders; return (median, mins, last) or None if
-    every measured frame had zero visible Gaussians."""
+def _measure_cell(pipeline, gaussians, extr, intr, H, W, warmup, measure, backend):
+    """Run warmup+measure renders; return (median, mins, bucket_median, last)
+    or None if every measured frame had zero visible Gaussians.
+
+    Buckets are computed per frame then medianed (not bucketed from the median
+    timings) so each bucket stays >= 0 — `transfer` is a per-frame residual and
+    medianing the raw timings independently could otherwise drive it negative."""
     for _ in range(warmup):
         pipeline.render(gaussians, extr, intr, H, W)
-    rows = []
+    rows, bucket_rows = [], []
     for _ in range(measure):
         r = pipeline.render(gaussians, extr, intr, H, W)
         if r.num_visible == 0:
@@ -54,19 +58,20 @@ def _measure_cell(pipeline, gaussians, extr, intr, H, W, warmup, measure):
         row = dict(r.timings)
         row.update(r.sub_timings)
         rows.append((row, r))
+        # to_buckets reads "blend"/"project" from timings and "blend.*" from
+        # sub_timings; `row` carries both, so pass it as both arguments.
+        bucket_rows.append(to_buckets(row, row, backend))
     if not rows:
         return None
     keys = sorted({k for row, _ in rows for k in row})
     med = {k: statistics.median(row[k] for row, _ in rows if k in row) for k in keys}
     mins = {k: min(row[k] for row, _ in rows if k in row) for k in keys}
+    bucket_med = {k: statistics.median(b[k] for b in bucket_rows) for k in bucket_rows[0]}
     last = rows[-1][1]
-    return med, mins, last
+    return med, mins, bucket_med, last
 
 
-def _build_record(backend, scene_name, n_gauss, H, W, med, mins, last):
-    sub = {k: v for k, v in med.items()
-           if k.startswith("blend.") or k in ("project", "tile_assign", "sort", "blend")}
-    buckets = to_buckets(med, sub, backend)
+def _build_record(backend, scene_name, n_gauss, H, W, med, mins, buckets, last):
     total = med.get("total", 0.0)
     return {
         "backend": backend, "scene": scene_name, "n_gaussians": n_gauss,
@@ -122,13 +127,13 @@ def main(argv=None):
                     continue
                 extr, intr = make_camera(gaussians.means, H, W)
                 out = _measure_cell(pipeline, gaussians, extr, intr,
-                                    H, W, args.warmup, args.measure)
+                                    H, W, args.warmup, args.measure, args.backend)
                 if out is None:
                     print(f"WARN {scene_name}@{H}: 0 visible Gaussians — skipped")
                     continue
-                med, mins, last = out
+                med, mins, bucket_med, last = out
                 rec = _build_record(args.backend, scene_name,
-                                    gaussians.num_gaussians, H, W, med, mins, last)
+                                    gaussians.num_gaussians, H, W, med, mins, bucket_med, last)
                 records.append(rec)
                 print(f"{scene_name}@{H}: total={rec['total_ms']:.1f}ms "
                       f"fps={rec['fps']:.1f} "

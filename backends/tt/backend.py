@@ -141,6 +141,9 @@ class KernelBackend(Backend):
             packs_dev = ttnn.from_torch(torch.from_numpy(packs_page), dtype=ttnn.float32, layout=rm, device=dev, memory_config=mc)
             offsets_dev = ttnn.from_torch(_u32_tensor(offsets_col), dtype=ttnn.uint32, layout=rm, device=dev, memory_config=mc)
             tile_ids_dev = ttnn.from_torch(_u32_tensor(tile_ids_page), dtype=ttnn.uint32, layout=rm, device=dev, memory_config=mc)
+            # ttnn calls are async (enqueue + return). Sync so upload_ms reflects
+            # real H2D completion, not just the enqueue cost.
+            ttnn.synchronize_device(dev)
             upload_ms = (time.perf_counter() - t) * 1000.0
 
             # --- op call (warm after first frame per resolution); op zero-inits empty tiles ---
@@ -150,13 +153,22 @@ class KernelBackend(Backend):
                 image_height=H, image_width=W, num_tiles=num_tiles,
                 per_core_offset=[int(x) for x in per_core_offset],
                 per_core_count=[int(x) for x in per_core_count])
+            # Sync so kernel_ms is the real device compute. Without it, the op
+            # only enqueues (~0.2 ms) and the blocking to_torch readback below
+            # would absorb the entire compute wait into download_ms. Free in
+            # wall-clock: the frame fully syncs at readback anyway and nothing
+            # pipelines across the upload->op->readback dependency chain.
+            ttnn.synchronize_device(dev)
             kernel_ms = (time.perf_counter() - t) * 1000.0
 
             # --- readback (num_tiles*3, 1024) bf16 -> (H, W, 3) ---
             t = time.perf_counter()
             out_t = ttnn.to_torch(out)                          # (num_tiles*3, 1024) bf16 torch
+            readback_ms = (time.perf_counter() - t) * 1000.0
+            t2 = time.perf_counter()
             image = self._tiles_to_image(out_t, tiles_x, tiles_y, H, W)
-            download_ms = (time.perf_counter() - t) * 1000.0
+            unpack_ms = (time.perf_counter() - t2) * 1000.0
+            download_ms = readback_ms + unpack_ms
         except Exception as e:
             # nerfview cancels an in-flight render by raising InterruptRenderException
             # from a trace hook at an arbitrary line — that's cooperative control
@@ -171,6 +183,7 @@ class KernelBackend(Backend):
         return image, {
             "prep": prep_ms, "upload": upload_ms,
             "kernel": kernel_ms, "download": download_ms,
+            "readback": readback_ms, "unpack": unpack_ms,
         }
 
     @staticmethod

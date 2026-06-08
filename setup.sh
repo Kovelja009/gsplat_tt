@@ -159,6 +159,68 @@ open(path, "w").write(s)
 PY
 fi
 
+# ----- 3c. Register the combine op (alpha_blend_combine) in the ttnn build ---
+# Phase-2 of intra-tile parallelism. Same untracked-upstream-file injection as
+# alpha_blend above; anchored on the alpha_blend lines so combine slots in after.
+CB_SUBDIR="cpp/ttnn/operations/experimental/gaussian_splatting/alpha_blend_combine"
+CB_LINK="TTNN::Ops::Experimental::GaussianSplatting::AlphaBlendCombine"
+if [ -f "$TTNN_CMAKE" ]; then
+    if ! grep -qF "add_subdirectory($CB_SUBDIR)" "$TTNN_CMAKE"; then
+        say "Registering alpha_blend_combine op add_subdirectory in $TTNN_CMAKE"
+        python3 - "$TTNN_CMAKE" "$CB_SUBDIR" <<'PY'
+import sys
+path, subdir = sys.argv[1], sys.argv[2]
+s = open(path).read()
+anchor = "add_subdirectory(cpp/ttnn/operations/experimental/gaussian_splatting/alpha_blend)\n"
+ins = f"add_subdirectory({subdir})\n"
+s = s.replace(anchor, anchor + ins, 1) if anchor in s else s + "\n" + ins
+open(path, "w").write(s)
+PY
+    fi
+    if ! grep -qF "$CB_LINK" "$TTNN_CMAKE"; then
+        say "Linking $CB_LINK into the ttnn target"
+        python3 - "$TTNN_CMAKE" "$CB_LINK" <<'PY'
+import sys
+path, lib = sys.argv[1], sys.argv[2]
+s = open(path).read()
+anchor = "        TTNN::Ops::Experimental::GaussianSplatting::AlphaBlend\n"
+ins = f"        {lib}\n"
+s = s.replace(anchor, anchor + ins, 1) if anchor in s else s
+open(path, "w").write(s)
+PY
+    fi
+fi
+CB_NB_SRC="cpp/ttnn/operations/experimental/gaussian_splatting/alpha_blend_combine/alpha_blend_combine_nanobind.cpp"
+if [ -f "$TTNN_SRCS" ] && ! grep -qF "$CB_NB_SRC" "$TTNN_SRCS"; then
+    say "Registering alpha_blend_combine nanobind source in $TTNN_SRCS"
+    python3 - "$TTNN_SRCS" "$CB_NB_SRC" <<'PY'
+import sys
+path, src = sys.argv[1], sys.argv[2]
+s = open(path).read()
+anchor = "    cpp/ttnn/operations/experimental/gaussian_splatting/alpha_blend/alpha_blend_nanobind.cpp\n"
+ins = f"    {src}\n"
+s = s.replace(anchor, anchor + ins, 1) if anchor in s else s
+open(path, "w").write(s)
+PY
+fi
+if [ -f "$EXP_NB" ] && ! grep -qF "gaussian_splatting/alpha_blend_combine/alpha_blend_combine_nanobind.hpp" "$EXP_NB"; then
+    say "Wiring alpha_blend_combine nanobind into $EXP_NB"
+    python3 - "$EXP_NB" <<'PY'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+inc_anchor = '#include "ttnn/operations/experimental/gaussian_splatting/alpha_blend/alpha_blend_nanobind.hpp"\n'
+inc = '#include "ttnn/operations/experimental/gaussian_splatting/alpha_blend_combine/alpha_blend_combine_nanobind.hpp"\n'
+if inc_anchor in s:
+    s = s.replace(inc_anchor, inc_anchor + inc, 1)
+call_anchor = '    gaussian_splatting::alpha_blend::detail::bind_gaussian_alpha_blend(mod);\n'
+call = '    gaussian_splatting::alpha_blend_combine::detail::bind_gaussian_alpha_blend_combine(mod);\n'
+if call_anchor in s:
+    s = s.replace(call_anchor, call_anchor + call, 1)
+open(path, "w").write(s)
+PY
+fi
+
 # ----- 4. Build tt-metal + ttnn (incl. our op) ------------------------------
 # We no longer pass --without-python-bindings, so build_metal.sh builds the
 # ttnn Python extensions (_ttnn.so) including our gaussian_splatting/alpha_blend

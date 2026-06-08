@@ -69,6 +69,10 @@ will simply not appear in the backend registry.
 | `--port N` | `8080` | Viewer port. |
 | `-v` / `--verbose` | off | Per-frame stage timing. |
 
+Environment: `GSPLAT_TT_SPLIT=0` forces the TT backend's legacy single-op kernel
+(disables the two-phase intra-tile-parallel path; default is on). See
+[Performance → Intra-tile parallelism](#intra-tile-parallelism-two-phase-dense-scenes).
+
 ## Benchmarks
 
 Each viewer session writes a markdown summary to `benchmarks/` on shutdown
@@ -79,8 +83,9 @@ visible Gaussians) are excluded from the aggregate.
 The report records date, backend, scene, Gaussian count, the actual
 modal `W×H`, and the per-stage **median** across all sampled frames —
 plus the median total and the FPS implied by it. The TT backend's
-`blend(...)` reports sub-timings (`prep`, `upload`, `kernel`, `download`),
-nested under the parent stage in the table.
+`blend(...)` reports sub-timings (`prep`, `upload`, `kernel`, `download` — plus
+`partial_kernel`/`combine_kernel` on the two-phase split path), nested under the
+parent stage in the table.
 
 For headless, repeatable benchmarking, `scripts/bench_scene.py` runs the full
 pipeline on a real `.ply` and prints the per-stage breakdown (pass `--cpu` to
@@ -117,16 +122,18 @@ reported separately.
    (this puts the `gsplat` command on PATH). `numpy` is pinned `<2` because
    ttnn requires it.
 2. Clone `tenstorrent/tt-metal` into `backends/tt/tt-metal/` (~5 GB).
-3. Inject the build wiring for our ttnn op into tt-metal's CMake / nanobind
-   (idempotent; only our op subtree is tracked by git).
+3. Inject the build wiring for our three ttnn ops (`alpha_blend`,
+   `alpha_blend_partial`, `alpha_blend_combine`) into tt-metal's CMake / nanobind
+   (idempotent; only our op subtrees are tracked by git).
 4. `sudo ./build_metal.sh --build-programming-examples` to compile the C++ libs
    **and** the ttnn Python extension (including our op), then
    `pip install -e backends/tt/tt-metal` to install `ttnn` into `./venv`. `sudo`
    is needed for tt-metal's root-owned SFPI / CPM caches.
 
-The TT backend drives the device **in-process** through a custom ttnn op
-(`ttnn.experimental.gaussian_alpha_blend`) — there is no daemon subprocess, and
-everything (viewer, tests, `ttnn`) runs in the single `./venv`.
+The TT backend drives the device **in-process** through custom ttnn ops
+(`ttnn.experimental.gaussian_alpha_blend`, plus `…_partial` / `…_combine` for the
+intra-tile-parallel split path) — there is no daemon subprocess, and everything
+(viewer, tests, `ttnn`) runs in the single `./venv`.
 
 Pin a specific tt-metal version with `TT_METAL_REF=v1.2.3 ./setup.sh`.
 
@@ -154,10 +161,11 @@ gsplat_tt/
 └── backends/                  # one subpackage per accelerator
     ├── README.md              # how to add a new backend
     ├── tt/                    # Tenstorrent (tt-metal)
-    │   ├── backend.py         # in-process ttnn-op caller (open device once)
-    │   ├── lpt.py             # host-side LPT tile→core load balancer
-    │   └── tt-metal/          # vendored SDK + our ttnn op under
-    │       └── ttnn/cpp/ttnn/operations/experimental/gaussian_splatting/alpha_blend/
+    │   ├── backend.py         # in-process ttnn-op caller; single-op or two-phase split path
+    │   ├── lpt.py             # host-side LPT tile→core load balancer (single-op path)
+    │   ├── segments.py        # depth-segment scheduler + over-merge (intra-tile parallelism)
+    │   └── tt-metal/          # vendored SDK + our 3 ttnn ops under
+    │       └── …/experimental/gaussian_splatting/{alpha_blend, alpha_blend_partial, alpha_blend_combine}/
     └── cuda/                  # CUDA backend (kernels JIT-compiled on first use)
 ```
 
@@ -175,15 +183,16 @@ below preserve the image to ~41 dB PSNR vs the CPU reference.
 
 | Scene | Gaussians (visible) | Frame time | |
 |---|--:|--:|--:|
-| luigi.ply | 14.5K | ~28 ms | ~36 fps |
-| train.ply | 608K | ~308 ms | ~3 fps |
+| luigi.ply | 14.5K  | ~24 ms  | ~42 fps |
+| train.ply | 608K   | ~224 ms | ~4.5 fps |
 
 The CPU reference renders the same scenes at seconds-to-minutes per frame (its
-alpha-blend alone is ~3.5 s on luigi). The pipeline is **device-bound** on big
-scenes — the kernel is ~130 ms on `train.ply`; the rest is shared CPU stages.
-Where a single frame's ~28 ms goes on luigi 640: device kernel ~9 ms, CPU
-project/tile/sort ~9 ms, host pack/upload/readback ~3 ms, the remainder
-dispatch + sync overhead.
+alpha-blend alone is ~3.5 s on luigi). With **intra-tile parallelism** (below)
+the device compute on `train.ply` dropped to ~46 ms at 640 (it was ~130 ms), and
+the frame is now **host-bound**: the per-frame CPU prep + upload (~74 ms) exceeds
+device compute (~46 ms). Where a single frame's ~24 ms goes on luigi 640: device
+compute ~7.5 ms, host pack/upload ~5 ms, readback + dispatch ~3 ms, CPU
+project/tile/sort ~8 ms.
 
 ### Host data path
 
@@ -215,6 +224,107 @@ Tensix cores (~21× over a single core), approximate `exp`, an opacity cull
 (peak contribution < 1/255), and a bounding-radius cap — the last two together
 cut a 1M+-Gaussian scene from ~6 s to under 1 s.
 
+### Intra-tile parallelism (two-phase, dense scenes)
+
+A 32×32 tile is the *atomic* unit of the single-op kernel: one core composites
+all of a tile's Gaussians front-to-back, so a frame can't finish until the
+**densest tile** does. On `train.ply` the densest tile holds ~63K low-opacity
+Gaussians, which made `train@256` compute ~345 ms (and, counterintuitively,
+*faster* at higher resolution, as the dense screen region subdivides into more
+tiles — see `docs/plan_progress.md` for the investigation).
+
+When a tile's Gaussian count exceeds the per-core ideal
+(`target = total_entries / num_cores`), the backend splits it into K contiguous
+**depth-segments** and renders in two device passes:
+
+1. **`ttnn.experimental.gaussian_alpha_blend_partial`** — each segment is
+   composited on its own core into a partial `(R, G, B, T)`; the 4th plane is the
+   segment's leftover per-pixel transmittance.
+2. **`ttnn.experimental.gaussian_alpha_blend_combine`** — the partials are merged
+   per tile, in depth order, via the associative Porter-Duff *over* operator:
+   `C = C₀ + T₀·C₁ + T₀T₁·C₂ + …`.
+
+The host scheduler `backends/tt/segments.py::build_segmented_assignment` does the
+split and LPT-balances the resulting segment-jobs across cores. The backend takes
+this path automatically whenever a tile splits (`num_jobs > non-empty tiles`) and
+leaves scenes with no heavy tiles (e.g. luigi) on the untouched single op; set
+`GSPLAT_TT_SPLIT=0` to force the legacy single-op path. The merge is exact in real
+arithmetic (only bf16 rounding differs) — validated at 45–47 dB vs the CPU
+reference on dense scenes.
+
+Effect on `train.ply` device compute (single-op → two-phase, Blackhole 130 cores):
+
+| res | single-op | two-phase | speedup |
+|----:|----------:|----------:|--------:|
+| 256 | 345 ms | 41 ms | **8.5×** |
+| 480 | 189 ms | 44 ms | 4.3× |
+| 640 | 130 ms | 46 ms | 2.8× |
+| 960 |  73 ms | 55 ms | 1.3× |
+
+Compute is now ~flat across resolution (the inversion is gone); `train` becomes
+host-bound. luigi (no heavy tiles) is unaffected.
+
+### Scheduling: choosing the kernel, splitting, and balancing
+
+**Choosing the kernel.** The host builds the segmented schedule every frame and
+picks the path with one test (`backends/tt/backend.py`):
+
+```python
+sched = build_segmented_assignment(offsets, num_tiles, self.num_cores)
+if sched.num_jobs > sched.combine_plan.shape[0]:   # at least one tile was split
+    # two-phase: partial → combine
+else:
+    # single op
+```
+
+`combine_plan` has exactly one row per non-empty tile and `num_jobs` is the total
+segment count, so they're equal **iff** nothing split. luigi → equal → single op
+(zero overhead); train → some tile exceeds `target` → two-phase. `GSPLAT_TT_SPLIT=0`
+forces the single op regardless.
+
+**Two problems, two tools.** Cores run in parallel, so a frame's compute time is
+the **busiest core's** time, and a core's time is proportional to the total
+Gaussian load of the jobs assigned to it. Minimizing the busiest core faces two
+independent obstacles:
+
+1. *Balancing across cores* — spreading many variable-sized work units so no core
+   is overloaded. **LPT** (greedy longest-processing-time-first: sort jobs
+   heaviest-first, drop each onto the currently least-loaded core) solves this. It
+   runs on **both** paths — `lpt.py::build_tile_assignment` balances whole tiles
+   (single op), `segments.py::build_segmented_assignment` balances segment-jobs
+   (two-phase) — and both balance by **Gaussian load**, not job count. Without it,
+   load variance or spatial clustering of dense tiles could pile several heavy
+   units on one core. (Real frames land in the `jobs > cores` regime where LPT
+   genuinely bin-packs: `train@256` produces 174 segment-jobs on 130 cores — up to
+   2 per core — and `train@960` produces 918, up to 8 per core. Only when
+   `num_jobs ≤ num_cores` would LPT degenerate to one-job-per-core.)
+
+2. *Units too big to balance* — LPT can't help when a single unit already exceeds
+   a core's fair share, because a tile is **atomic**: it just parks the monster
+   tile on one core, and that core becomes the floor (on `train@256`, one tile =
+   75K Gaussians vs an ideal of ~6.7K). **Segmentation** solves this by splitting
+   any tile over `target` into contiguous depth-pieces ≤ `target`, bounding the
+   largest unit LPT has to place.
+
+They compose: **segmentation caps the biggest job; LPT then packs the jobs to
+balance the per-core sums.**
+
+**Why `target = total_entries / num_cores`.** Two hard lower bounds on the busiest
+core — no schedule can beat either:
+
+- `total / cores` — the average; you can't do better than perfectly even spreading.
+- `max single job` — the largest indivisible piece.
+
+Choosing `target = total/cores` makes every job ≤ the average, so the second bound
+never dominates the first and the schedule can approach the `total/cores` floor.
+Splitting finer can't beat that floor (it's the parallelism limit) — it only adds
+per-job overhead (each job re-streams its tile's `px/py` + CB setup) and risks the
+per-core job cap (`MAX_TILE_IDS_PER_CORE = 256`, enforced with a loud error). So
+`total/cores` is the sweet spot: small enough to be balanceable, not so small that
+overhead dominates. If device compute at that floor is still too slow, intra-tile
+parallelism is exhausted (as on `train`, now host-bound) — the remaining levers are
+fewer Gaussians, more cores, or a faster per-Gaussian kernel.
+
 ## Testing
 
 ```bash
@@ -222,10 +332,13 @@ source venv/bin/activate
 pytest tests/
 ```
 
-`test_numeric_sanity.py` and `test_lpt.py` run anywhere; the device tests
-(`test_kernel_integration.py` — PSNR, empty-tile, perf — and
-`test_ttnn_op_cache.py` — program-cache warm-frame invariant) skip cleanly
-without a Tenstorrent device.
+`test_numeric_sanity.py`, `test_lpt.py`, and `test_tt_segments.py` (the
+intra-tile depth-segment scheduler + associative-`over` merge math) run
+anywhere; the device tests (`test_kernel_integration.py` — PSNR, empty-tile,
+perf — and `test_ttnn_op_cache.py` — program-cache warm-frame invariant) skip
+cleanly without a Tenstorrent device. Note: the two-phase `partial`/`combine`
+ops are validated against the CPU reference manually (see `docs/plan_progress.md`)
+but do not yet have a committed device test.
 
 ## References
 

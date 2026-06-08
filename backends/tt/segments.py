@@ -10,11 +10,12 @@ See docs/superpowers/specs/2026-06-08-intra-tile-parallelism-design.md
 """
 from __future__ import annotations
 
-import heapq
 import math
 from dataclasses import dataclass
 
 import numpy as np
+
+from backends.tt.lpt import greedy_lpt
 
 
 def composite_tile(gx, gy, means, cov_inv, colors, opac, gidx):
@@ -123,15 +124,9 @@ def build_segmented_assignment(offsets, num_tiles, num_cores, target=None):
             slot += 1
     num_jobs = len(jobs)
 
-    # Greedy-LPT: heaviest segment first onto the least-loaded core.
-    order = sorted(range(num_jobs), key=lambda j: jobs[j][2], reverse=True)
-    buckets = [[] for _ in range(num_cores)]
-    heap = [(0, c) for c in range(num_cores)]
-    heapq.heapify(heap)
-    for j in order:
-        cur, c = heapq.heappop(heap)
-        buckets[c].append(j)
-        heapq.heappush(heap, (cur + jobs[j][2], c))
+    # Greedy-LPT: heaviest segment-job (by Gaussian count) first onto the
+    # least-loaded core. Shared with the single-op scheduler (lpt.greedy_lpt).
+    buckets = greedy_lpt([(j, jobs[j][2]) for j in range(num_jobs)], num_cores)
 
     per_core_offset = np.zeros(num_cores, dtype=np.uint32)
     per_core_count = np.zeros(num_cores, dtype=np.uint32)

@@ -24,10 +24,12 @@
 //       T_acc *= T_i
 //   out = C_acc                      # T_acc discarded
 //
-// Accumulators C_acc (CB_C_R/G/B) and T_acc (CB_T_ACC) are fp32 and spilled to
-// L1 CBs between segments (Dst is too small to hold them across the loop, same
-// pattern as the single-phase compute kernel). CB_PROD is fp32 scratch for the
-// T_acc*C_i product. The reader pushes 4 partial tiles (R,G,B,T) per segment.
+// Accumulators C_acc (CB_C_R/G/B) and T_acc (CB_T_ACC) are spilled to L1 CBs
+// between segments (Dst is too small to hold them across the loop, same pattern
+// as the single-phase compute kernel). These CBs are bf16 (fp32_dest_acc_en
+// keeps the in-Dst math fp32; only the inter-segment spill is bf16). CB_PROD is
+// the bf16 scratch for the T_acc*C_i product. The reader pushes 4 partial tiles
+// (R,G,B,T) per segment.
 //
 // RUNTIME ARGS  0: plan_count (output tiles this core owns)
 

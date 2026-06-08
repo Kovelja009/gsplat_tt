@@ -31,18 +31,19 @@ constexpr const char* kWriterKernel =
     "ttnn/cpp/ttnn/operations/experimental/gaussian_splatting/alpha_blend_combine/device/kernels/dataflow/"
     "writer_combine.cpp";
 
-// CB indices — must match the combine kernels.
+// CB indices — must match the combine kernels. All tile CBs are bf16
+// (DataFormat::Float16_b); fp32_dest_acc_en keeps the in-Dst math fp32, only the
+// inter-segment L1 spills are bf16 (see the CB-creation block below).
 constexpr uint32_t CB_PARTIAL  = 0;   // bf16 partial tiles (R,G,B,T per job)
 constexpr uint32_t CB_META     = 1;   // one uint32 (K) per output tile
-constexpr uint32_t CB_PROD     = 15;  // fp32 scratch: T_acc * C_i (and T_acc * T_i)
+constexpr uint32_t CB_PROD     = 15;  // bf16 scratch: T_acc * C_i (and T_acc * T_i)
 constexpr uint32_t CB_COLOR_OUT = 16; // R,G,B output tiles
-constexpr uint32_t CB_C_R      = 17;  // fp32 running color accumulators
+constexpr uint32_t CB_C_R      = 17;  // bf16 running color accumulators
 constexpr uint32_t CB_C_G      = 18;
 constexpr uint32_t CB_C_B      = 19;
-constexpr uint32_t CB_T_ACC    = 20;  // fp32 running transmittance
+constexpr uint32_t CB_T_ACC    = 20;  // bf16 running transmittance
 
 constexpr uint32_t TILE_BYTES_BF16 = 32 * 32 * 2;  // 2048
-constexpr uint32_t TILE_BYTES_FP32 = 32 * 32 * 4;  // 4096
 constexpr uint32_t META_PAGE_BYTES = 64;           // padded uint32 page
 constexpr uint32_t PLAN_PAGE_BYTES = 16;           // 4 u32 per plan row
 

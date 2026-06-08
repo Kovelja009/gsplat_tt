@@ -28,7 +28,7 @@ import ttnn
 
 from gsplat.backend import Backend
 from gsplat.rasterization import prepare_kernel_inputs
-from backends.tt.lpt import build_tile_assignment
+from backends.tt.lpt import build_tile_assignment, greedy_lpt
 from backends.tt.segments import build_segmented_assignment
 
 PACK_FLOATS = 16                      # 9 used + 7 zero-pad (64-byte SCALAR_PACK_PAGE)
@@ -119,21 +119,22 @@ class KernelBackend(Backend):
                 f"per-core job count {int(sched.per_core_count.max())} exceeds the kernel "
                 f"cap {MAX_TILE_IDS_PER_CORE} at {H}x{W}; lower resolution or raise the cap.")
 
-        # --- combine plan: pad to 4 cols, distribute rows contiguously across cores ---
-        plan = sched.combine_plan
+        # --- combine plan: LPT-balance output tiles across cores by their segment
+        # count K (combine cost per tile ∝ K), then lay the plan rows out
+        # core-contiguous so each core reads plan[cpo[c] : cpo[c]+cpc[c]]. ---
+        plan = sched.combine_plan                      # (nplan, 3) [out_tile, first_slot, K]
         nplan = plan.shape[0]
-        plan4 = np.zeros((nplan, 4), dtype=np.uint32)
-        plan4[:, :3] = plan
         nc = self.num_cores
-        base, rem = divmod(nplan, nc)
+        buckets = greedy_lpt([(i, int(plan[i, 2])) for i in range(nplan)], nc)
         cpo = np.zeros(nc, dtype=np.uint32)
         cpc = np.zeros(nc, dtype=np.uint32)
-        off = 0
+        row_order: list[int] = []
         for c in range(nc):
-            cnt = base + (1 if c < rem else 0)
-            cpo[c] = off
-            cpc[c] = cnt
-            off += cnt
+            cpo[c] = len(row_order)
+            cpc[c] = len(buckets[c])
+            row_order.extend(buckets[c])
+        plan4 = np.zeros((nplan, 4), dtype=np.uint32)
+        plan4[:, :3] = plan[row_order]                 # rows grouped by owning core
 
         # --- upload ---
         t = time.perf_counter()
@@ -144,31 +145,41 @@ class KernelBackend(Backend):
         ttnn.synchronize_device(dev)
         upload_ms = (time.perf_counter() - t) * 1000.0
 
-        # --- phase 1: partial composite (each core does its segment-jobs) ---
-        t = time.perf_counter()
-        partials = ttnn.experimental.gaussian_alpha_blend_partial(
-            packs_dev, px_dev, py_dev, job_dev,
-            image_height=H, image_width=W, num_tiles=num_tiles, num_jobs=sched.num_jobs,
-            per_core_offset=[int(x) for x in sched.per_core_offset],
-            per_core_count=[int(x) for x in sched.per_core_count])
-        ttnn.synchronize_device(dev)
-        partial_ms = (time.perf_counter() - t) * 1000.0
+        try:
+            # --- phase 1: partial composite (each core does its segment-jobs) ---
+            t = time.perf_counter()
+            partials = ttnn.experimental.gaussian_alpha_blend_partial(
+                packs_dev, px_dev, py_dev, job_dev,
+                image_height=H, image_width=W, num_tiles=num_tiles, num_jobs=sched.num_jobs,
+                per_core_offset=[int(x) for x in sched.per_core_offset],
+                per_core_count=[int(x) for x in sched.per_core_count])
+            ttnn.synchronize_device(dev)
+            partial_ms = (time.perf_counter() - t) * 1000.0
 
-        # --- phase 2: combine (associative over-merge per tile) ---
-        t = time.perf_counter()
-        out = ttnn.experimental.gaussian_alpha_blend_combine(
-            partials, plan_dev, num_tiles=num_tiles,
-            per_core_offset=[int(x) for x in cpo], per_core_count=[int(x) for x in cpc])
-        ttnn.synchronize_device(dev)
-        combine_ms = (time.perf_counter() - t) * 1000.0
+            # --- phase 2: combine (associative over-merge per tile) ---
+            t = time.perf_counter()
+            out = ttnn.experimental.gaussian_alpha_blend_combine(
+                partials, plan_dev, num_tiles=num_tiles,
+                per_core_offset=[int(x) for x in cpo], per_core_count=[int(x) for x in cpc])
+            ttnn.synchronize_device(dev)
+            combine_ms = (time.perf_counter() - t) * 1000.0
 
-        # --- readback ---
-        t = time.perf_counter()
-        out_t = ttnn.to_torch(out)
-        readback_ms = (time.perf_counter() - t) * 1000.0
-        t2 = time.perf_counter()
-        image = self._tiles_to_image(out_t, tiles_x, tiles_y, H, W)
-        unpack_ms = (time.perf_counter() - t2) * 1000.0
+            # --- readback ---
+            t = time.perf_counter()
+            out_t = ttnn.to_torch(out)
+            readback_ms = (time.perf_counter() - t) * 1000.0
+            t2 = time.perf_counter()
+            image = self._tiles_to_image(out_t, tiles_x, tiles_y, H, W)
+            unpack_ms = (time.perf_counter() - t2) * 1000.0
+        except Exception as e:
+            # Match the single-op path: let nerfview's cooperative-cancel
+            # InterruptRenderException propagate untouched; wrap genuine device
+            # faults with scene-size context for diagnosability.
+            if type(e).__name__ == "InterruptRenderException":
+                raise
+            raise RuntimeError(
+                f"TT two-phase alpha_blend failed at {H}x{W} ({num_tiles} tiles, "
+                f"{sched.num_jobs} segment-jobs): {e}") from e
 
         return image, {
             "prep": prep_ms, "upload": upload_ms,
@@ -195,13 +206,18 @@ class KernelBackend(Backend):
         offsets = np.ascontiguousarray(offsets).astype(np.uint32).reshape(-1)
         prep_ms = (time.perf_counter() - t) * 1000.0
 
-        # --- Intra-tile parallelism: if the segmented schedule splits a heavy
-        # tile across cores, render via the two-phase partial+combine path.
-        # combine_plan has one row per non-empty tile, so num_jobs > its length
-        # iff at least one tile was split. ---
+        # --- Intra-tile parallelism: render via the two-phase partial+combine
+        # path when a tile is heavy enough to split across cores. A tile splits
+        # iff its load exceeds target = ceil(total / num_cores), so a cheap
+        # max-load check tells us whether to build the (more expensive) segmented
+        # schedule at all — avoiding a wasted segmentation+LPT pass on the common
+        # no-split frame (which then falls through to the single-op LPT below). ---
         if self._split_enabled:
-            sched = build_segmented_assignment(offsets, num_tiles, self.num_cores)
-            if sched.num_jobs > sched.combine_plan.shape[0]:
+            loads = offsets[1:num_tiles + 1].astype(np.int64) - offsets[:num_tiles].astype(np.int64)
+            total = int(loads.sum())
+            target = max(1, -(-total // max(1, self.num_cores)))   # ceil(total / num_cores)
+            if loads.size and int(loads.max()) > target:
+                sched = build_segmented_assignment(offsets, num_tiles, self.num_cores, target)
                 packs_page = self._packs_page(packs, total_entries)
                 return self._blend_two_phase(
                     H, W, tiles_x, tiles_y, num_tiles, packs_page, px, py, sched, prep_ms)

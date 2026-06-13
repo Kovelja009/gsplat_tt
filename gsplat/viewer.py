@@ -174,7 +174,11 @@ class GaussianViewer:
                 req_W / req_H if req_H > 0 else 0.0
             )
 
-        if req_W <= 0 or req_H <= 0 or aspect <= 0:
+        # The render size is derived purely from `aspect` + max_resolution, so
+        # a valid aspect is sufficient even if nerfview hasn't reported
+        # viewer_width/height yet (e.g. the first frame). Only bail when we
+        # have no usable aspect at all.
+        if aspect <= 0:
             return req_W, req_H, max(req_W, 1), max(req_H, 1)
 
         if aspect >= 1.0:  # landscape: H is the shorter dim

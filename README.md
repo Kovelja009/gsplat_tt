@@ -114,6 +114,30 @@ and PNGs. Each blend timing is split into **load** (stage inputs) /
 wall time. The shared host pre-stages (project / tile_assign / sort) are
 reported separately.
 
+### Scheduling-strategy comparison (TT)
+
+Compare the three tile→core scheduling strategies across both scenes:
+
+```bash
+source venv/bin/activate
+export TT_METAL_HOME=$PWD/backends/tt/tt-metal
+export TT_METAL_RUNTIME_ROOT=$PWD/backends/tt/tt-metal
+
+python -m benchmark.run tt --sched round_robin   # load-blind baseline, single-op kernel
+python -m benchmark.run tt --sched lpt           # greedy-LPT, single-op kernel
+python -m benchmark.run tt --sched segmented     # two-phase + LPT over depth-segments (default)
+
+python -m benchmark.compare_sched \
+    benchmark/results/sched_round_robin/tt.csv \
+    benchmark/results/sched_lpt/tt.csv \
+    benchmark/results/sched_segmented/tt.csv
+```
+
+Each `run` writes `benchmark/results/sched_<mode>/tt.{csv,json}`. `compare_sched`
+writes a grouped-bar `compute_ms` plot per scene plus a combined CSV to
+`benchmark/results/sched_compare/`. `compute_ms` (kernel wall-clock, bound by the
+densest core's load) is the metric the scheduling strategy moves.
+
 ## Setup details
 
 `./setup.sh` is idempotent and does:

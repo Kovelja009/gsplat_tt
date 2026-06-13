@@ -256,9 +256,6 @@ docs/thesis_plan.md
 # Per-run benchmark markdowns written by the viewer on shutdown.
 /benchmarks/
 
-# Benchmark harness runtime output (CSV/JSON/PNG).
-/benchmark/results/
-
 # IDE / editor settings — uncomment to also ignore .idea/ if you don't use JetBrains
 .vscode/
 

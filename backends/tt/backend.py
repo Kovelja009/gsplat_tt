@@ -28,7 +28,7 @@ import ttnn
 
 from gsplat.backend import Backend
 from gsplat.rasterization import prepare_kernel_inputs
-from backends.tt.lpt import build_tile_assignment, greedy_lpt
+from backends.tt.lpt import build_tile_assignment, build_round_robin_assignment, greedy_lpt
 from backends.tt.segments import build_segmented_assignment
 
 PACK_FLOATS = 16                      # 9 used + 7 zero-pad (64-byte SCALAR_PACK_PAGE)
@@ -55,7 +55,7 @@ def _u32_tensor(arr: np.ndarray) -> torch.Tensor:
 
 
 class KernelBackend(Backend):
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, sched: str | None = None):
         self.verbose = verbose
         self.device = ttnn.open_device(device_id=0)
         self.device.enable_program_cache()
@@ -69,10 +69,16 @@ class KernelBackend(Backend):
         # max entry count seen. Avoids a per-frame np.zeros of the whole buffer
         # (the pad columns [9:16] stay zero once allocated).
         self._packs_scratch: np.ndarray | None = None
-        # Intra-tile parallelism: when the segmented schedule splits a heavy tile
-        # across cores, render via the two-phase partial+combine ops. On by
-        # default; GSPLAT_TT_SPLIT=0 forces the legacy single-op path always.
-        self._split_enabled = os.environ.get("GSPLAT_TT_SPLIT", "1") != "0"
+        # Scheduling strategy: "round_robin" | "lpt" | "segmented" (default).
+        # round_robin/lpt use the single-op kernel (differ only in the tile->core
+        # assignment builder); segmented uses the two-phase partial+combine ops
+        # with intra-tile depth-splitting. Precedence: explicit arg > GSPLAT_TT_SCHED
+        # env > GSPLAT_TT_SPLIT=0 alias (-> "lpt", back-compat) > "segmented".
+        self._sched = (sched or os.environ.get("GSPLAT_TT_SCHED")
+                       or ("lpt" if os.environ.get("GSPLAT_TT_SPLIT") == "0" else "segmented"))
+        if self._sched not in ("round_robin", "lpt", "segmented"):
+            raise ValueError(
+                f"unknown sched {self._sched!r}; expected round_robin | lpt | segmented")
 
     def _resident_grids(self, H, W, px, py, num_tiles):
         """Upload (once per resolution) and return the resident px/py device tensors."""
@@ -212,7 +218,7 @@ class KernelBackend(Backend):
         # max-load check tells us whether to build the (more expensive) segmented
         # schedule at all — avoiding a wasted segmentation+LPT pass on the common
         # no-split frame (which then falls through to the single-op LPT below). ---
-        if self._split_enabled:
+        if self._sched == "segmented":
             loads = offsets[1:num_tiles + 1].astype(np.int64) - offsets[:num_tiles].astype(np.int64)
             total = int(loads.sum())
             target = max(1, -(-total // max(1, self.num_cores)))   # ceil(total / num_cores)
@@ -222,8 +228,13 @@ class KernelBackend(Backend):
                 return self._blend_two_phase(
                     H, W, tiles_x, tiles_y, num_tiles, packs_page, px, py, sched, prep_ms)
 
-        # --- LPT schedule (host) ---
-        per_core_offset, per_core_count, tile_ids = build_tile_assignment(
+        # --- single-op schedule (host): lpt = greedy-LPT, round_robin = load-blind.
+        # "segmented" also lands here on no-split frames (no tile heavy enough to
+        # split); its single-op fallback uses LPT, matching pre-sched behavior. ---
+        builder = {"lpt": build_tile_assignment,
+                   "segmented": build_tile_assignment,
+                   "round_robin": build_round_robin_assignment}[self._sched]
+        per_core_offset, per_core_count, tile_ids = builder(
             offsets, num_tiles, self.num_cores)
         max_per_core = int(per_core_count.max())
         if max_per_core > MAX_TILE_IDS_PER_CORE:

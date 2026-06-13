@@ -118,7 +118,16 @@ def main(argv=None):
         print(f"ERROR: backend {args.backend!r} unavailable: {e}", file=sys.stderr)
         return 2
 
-    out_dir = args.out or os.path.join("benchmark/results", f"sched_{args.sched}")
+    # Per-backend output dir; the TT backend additionally splits by scheduling
+    # strategy so its independent --sched runs don't overwrite each other.
+    #   cpu/cuda -> benchmark/results/<backend>/
+    #   tt       -> benchmark/results/tt/sched_<mode>/
+    if args.out:
+        out_dir = args.out
+    elif args.backend == "tt":
+        out_dir = os.path.join("benchmark/results", "tt", f"sched_{args.sched}")
+    else:
+        out_dir = os.path.join("benchmark/results", args.backend)
     os.makedirs(out_dir, exist_ok=True)
     records = []
     try:

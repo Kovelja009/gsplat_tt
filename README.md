@@ -103,12 +103,14 @@ python -m benchmark.run cuda --res 256 480 640 960
 python -m benchmark.run cpu  --res 256 480 --skip-cpu-above 480   # CPU is slow on train.ply
 
 # per-backend graphs (one CSV) or cross-backend comparison (multiple):
-python -m benchmark.plot benchmark/results/tt.csv
-python -m benchmark.plot benchmark/results/cpu.csv benchmark/results/cuda.csv benchmark/results/tt.csv
+python -m benchmark.plot benchmark/results/tt/sched_segmented/tt.csv
+python -m benchmark.plot benchmark/results/cpu/cpu.csv benchmark/results/cuda/cuda.csv benchmark/results/tt/sched_segmented/tt.csv
 ```
 
-Results land in `benchmark/results/` (gitignored): `<backend>.csv`, `.json`,
-and PNGs. Each blend timing is split into **load** (stage inputs) /
+Results land in `benchmark/results/<backend>/` (gitignored): `cpu/` and `cuda/`
+hold `<backend>.csv`, `.json`, and PNGs directly; `tt/` splits further by
+scheduling strategy (`tt/sched_<mode>/`, see below). Each blend timing is split
+into **load** (stage inputs) /
 **compute** (device kernel) / **return** (result to host) / **transfer**
 (residual host↔device movement); the four reconcile exactly to the blend
 wall time. The shared host pre-stages (project / tile_assign / sort) are
@@ -128,15 +130,15 @@ python -m benchmark.run tt --sched lpt           # greedy-LPT, single-op kernel
 python -m benchmark.run tt --sched segmented     # two-phase + LPT over depth-segments (default)
 
 python -m benchmark.compare_sched \
-    benchmark/results/sched_round_robin/tt.csv \
-    benchmark/results/sched_lpt/tt.csv \
-    benchmark/results/sched_segmented/tt.csv
+    benchmark/results/tt/sched_round_robin/tt.csv \
+    benchmark/results/tt/sched_lpt/tt.csv \
+    benchmark/results/tt/sched_segmented/tt.csv
 ```
 
-Each `run` writes `benchmark/results/sched_<mode>/tt.{csv,json}`. `compare_sched`
-writes a grouped-bar `compute_ms` plot per scene plus a combined CSV to
-`benchmark/results/sched_compare/`. `compute_ms` (kernel wall-clock, bound by the
-densest core's load) is the metric the scheduling strategy moves.
+Each `run` writes `benchmark/results/tt/sched_<mode>/tt.{csv,json}`.
+`compare_sched` writes a grouped-bar `compute_ms` plot per scene plus a combined
+CSV to `benchmark/results/sched_compare/`. `compute_ms` (kernel wall-clock,
+bound by the densest core's load) is the metric the scheduling strategy moves.
 
 ## Setup details
 

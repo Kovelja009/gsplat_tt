@@ -28,7 +28,7 @@ from benchmark.phases import to_buckets
 
 
 CSV_COLUMNS = [
-    "backend", "scene", "n_gaussians", "height", "width",
+    "backend", "sched", "scene", "n_gaussians", "height", "width",
     "num_visible", "num_entries",
     "project_ms", "tile_assign_ms", "sort_ms", "blend_ms", "total_ms", "fps",
     "load_ms", "compute_ms", "return_ms", "transfer_ms", "device_kernel_ms",
@@ -71,10 +71,10 @@ def _measure_cell(pipeline, gaussians, extr, intr, H, W, warmup, measure, backen
     return med, mins, bucket_med, last
 
 
-def _build_record(backend, scene_name, n_gauss, H, W, med, mins, buckets, last):
+def _build_record(backend, sched, scene_name, n_gauss, H, W, med, mins, buckets, last):
     total = med.get("total", 0.0)
     return {
-        "backend": backend, "scene": scene_name, "n_gaussians": n_gauss,
+        "backend": backend, "sched": sched, "scene": scene_name, "n_gaussians": n_gauss,
         "height": H, "width": W,
         "num_visible": last.num_visible, "num_entries": last.num_entries,
         "project_ms": round(med.get("project", 0.0), 3),
@@ -102,18 +102,33 @@ def main(argv=None):
     ap.add_argument("--res", nargs="+", type=int, default=[256, 480, 640, 960])
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--measure", type=int, default=20)
-    ap.add_argument("--out", default="benchmark/results")
+    ap.add_argument("--out", default=None,
+                    help="output dir (default: benchmark/results/sched_<sched>)")
+    ap.add_argument("--sched", choices=["round_robin", "lpt", "segmented"],
+                    default="segmented",
+                    help="TT tile->core scheduling strategy (ignored for cpu/cuda)")
     ap.add_argument("--skip-cpu-above", type=int, default=None,
                     help="skip (scene,res) rows where res > this value")
     args = ap.parse_args(argv)
 
+    kw = {"sched": args.sched} if args.backend == "tt" else {}
     try:
-        backend = get_backend(args.backend)
-    except (KeyError, RuntimeError, FileNotFoundError) as e:
+        backend = get_backend(args.backend, **kw)
+    except (KeyError, RuntimeError, FileNotFoundError, ValueError) as e:
         print(f"ERROR: backend {args.backend!r} unavailable: {e}", file=sys.stderr)
         return 2
 
-    os.makedirs(args.out, exist_ok=True)
+    # Per-backend output dir; the TT backend additionally splits by scheduling
+    # strategy so its independent --sched runs don't overwrite each other.
+    #   cpu/cuda -> benchmark/results/<backend>/
+    #   tt       -> benchmark/results/tt/sched_<mode>/
+    if args.out:
+        out_dir = args.out
+    elif args.backend == "tt":
+        out_dir = os.path.join("benchmark/results", "tt", f"sched_{args.sched}")
+    else:
+        out_dir = os.path.join("benchmark/results", args.backend)
+    os.makedirs(out_dir, exist_ok=True)
     records = []
     try:
         pipeline = Pipeline(backend)
@@ -132,7 +147,7 @@ def main(argv=None):
                     print(f"WARN {scene_name}@{H}: 0 visible Gaussians — skipped")
                     continue
                 med, mins, bucket_med, last = out
-                rec = _build_record(args.backend, scene_name,
+                rec = _build_record(args.backend, args.sched, scene_name,
                                     gaussians.num_gaussians, H, W, med, mins, bucket_med, last)
                 records.append(rec)
                 print(f"{scene_name}@{H}: total={rec['total_ms']:.1f}ms "
@@ -142,8 +157,8 @@ def main(argv=None):
     finally:
         pipeline.close()
 
-    csv_path = os.path.join(args.out, f"{args.backend}.csv")
-    json_path = os.path.join(args.out, f"{args.backend}.json")
+    csv_path = os.path.join(out_dir, f"{args.backend}.csv")
+    json_path = os.path.join(out_dir, f"{args.backend}.json")
     with open(csv_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
         w.writeheader()

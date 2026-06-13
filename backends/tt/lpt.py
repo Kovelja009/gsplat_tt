@@ -71,3 +71,33 @@ def build_tile_assignment(offsets: np.ndarray, num_tiles: int, num_cores: int):
 
     tile_ids = np.asarray(tile_ids_list, dtype=np.uint32)
     return per_core_offset, per_core_count, tile_ids
+
+
+def build_round_robin_assignment(offsets: np.ndarray, num_tiles: int, num_cores: int):
+    """Load-blind tile->core assignment: non-empty tile t -> core (t % num_cores).
+
+    Baseline against build_tile_assignment's greedy-LPT. Empty tiles are dropped
+    (their output slots stay zero via the op's pre-zero, exactly as in the LPT
+    builder); each surviving tile t is appended to core (t % num_cores). Tiles
+    are walked in ascending tile-id order, so a core's tile_ids slice is
+    ascending. Returns the same (per_core_offset, per_core_count, tile_ids)
+    tuple as build_tile_assignment, so the single-op path consumes it unchanged.
+    """
+    offsets = np.asarray(offsets, dtype=np.int64)
+    loads = offsets[1:num_tiles + 1] - offsets[:num_tiles]
+
+    buckets: list[list[int]] = [[] for _ in range(num_cores)]
+    for t in range(num_tiles):
+        if loads[t] > 0:
+            buckets[t % num_cores].append(t)
+
+    per_core_offset = np.zeros(num_cores, dtype=np.uint32)
+    per_core_count = np.zeros(num_cores, dtype=np.uint32)
+    tile_ids_list: list[int] = []
+    for c in range(num_cores):
+        per_core_offset[c] = len(tile_ids_list)
+        per_core_count[c] = len(buckets[c])
+        tile_ids_list.extend(buckets[c])
+
+    tile_ids = np.asarray(tile_ids_list, dtype=np.uint32)
+    return per_core_offset, per_core_count, tile_ids

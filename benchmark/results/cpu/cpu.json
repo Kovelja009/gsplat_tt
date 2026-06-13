@@ -1,0 +1,32 @@
+[
+  {
+    "backend": "cpu",
+    "sched": "segmented",
+    "scene": "luigi",
+    "n_gaussians": 14526,
+    "height": 256,
+    "width": 256,
+    "num_visible": 13919,
+    "num_entries": 56284,
+    "project_ms": 3.767,
+    "tile_assign_ms": 1.972,
+    "sort_ms": 1.253,
+    "blend_ms": 1924.172,
+    "total_ms": 1931.558,
+    "fps": 0.52,
+    "load_ms": 0.0,
+    "compute_ms": 1924.172,
+    "return_ms": 0.0,
+    "transfer_ms": 0.0,
+    "device_kernel_ms": 1924.172,
+    "blend_ms_min": 1919.009,
+    "total_ms_min": 1925.297,
+    "_raw_median": {
+      "blend": 1924.1715819953242,
+      "project": 3.766778507269919,
+      "sort": 1.2528490042313933,
+      "tile_assign": 1.9721319986274466,
+      "total": 1931.5578959940467
+    }
+  }
+]

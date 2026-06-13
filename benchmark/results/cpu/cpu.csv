@@ -1,0 +1,2 @@
+backend,sched,scene,n_gaussians,height,width,num_visible,num_entries,project_ms,tile_assign_ms,sort_ms,blend_ms,total_ms,fps,load_ms,compute_ms,return_ms,transfer_ms,device_kernel_ms,blend_ms_min,total_ms_min
+cpu,segmented,luigi,14526,256,256,13919,56284,3.767,1.972,1.253,1924.172,1931.558,0.52,0.0,1924.172,0.0,0.0,1924.172,1919.009,1925.297

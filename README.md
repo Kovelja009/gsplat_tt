@@ -107,7 +107,7 @@ python -m benchmark.plot benchmark/results/tt/sched_segmented/tt.csv
 python -m benchmark.plot benchmark/results/cpu/cpu.csv benchmark/results/cuda/cuda.csv benchmark/results/tt/sched_segmented/tt.csv
 ```
 
-Results land in `benchmark/results/<backend>/` (gitignored): `cpu/` and `cuda/`
+Results land in `benchmark/results/<backend>/` (tracked in-repo): `cpu/` and `cuda/`
 hold `<backend>.csv`, `.json`, and PNGs directly; `tt/` splits further by
 scheduling strategy (`tt/sched_<mode>/`, see below). Each blend timing is split
 into **load** (stage inputs) /

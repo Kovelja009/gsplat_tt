@@ -11,12 +11,12 @@ import torch
 
 
 def test_registry_import_is_safe_without_cuda():
-    """Importing `backends` must succeed on CPU-only boxes."""
+    """Importing `backends` must succeed regardless of host accelerators."""
     import backends  # must not raise
+    # `cpu` is the only mandatory backend. `tt` (needs ttnn) and `cuda` (needs
+    # a CUDA device) register lazily — each is present only if its deps import,
+    # so the absence of either must not break `import backends`.
     assert "cpu" in backends.REGISTRY
-    assert "tt" in backends.REGISTRY
-    # "cuda" may or may not be present depending on host; either is fine
-    # so long as the import did not blow up.
 
 
 def test_get_backend_cuda_errors_helpfully_when_unavailable():

@@ -14,13 +14,20 @@ from __future__ import annotations
 
 from gsplat.backend import Backend
 from backends.cpu.backend import CpuBackend
-from backends.tt.backend import KernelBackend
 
 
 REGISTRY: dict[str, type[Backend]] = {
     "cpu": CpuBackend,
-    "tt":  KernelBackend,
 }
+
+# KernelBackend (Tenstorrent) is optional — it imports `ttnn` at module load,
+# which isn't installed on a CUDA-only / CPU-only box. Register lazily so the
+# absence of ttnn doesn't break the cpu/cuda backends.
+try:
+    from backends.tt.backend import KernelBackend
+    REGISTRY["tt"] = KernelBackend
+except ImportError:
+    pass
 
 # CudaBackend is optional — register only if its module imports cleanly.
 # On a CPU-only box, the import itself is harmless (no top-level torch.cuda

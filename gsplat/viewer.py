@@ -138,14 +138,25 @@ class GaussianViewer:
         )
 
     def _resolve_render_size(
-        self, render_tab_state: nerfview.RenderTabState
+        self,
+        camera_state: nerfview.CameraState,
+        render_tab_state: nerfview.RenderTabState,
     ) -> tuple[int, int, int, int]:
         """Pick (W, H) for this frame.
 
         max_resolution sets the shorter dim (480p/720p/1080p convention);
-        the longer dim follows from the browser's aspect ratio. Both dims
+        the longer dim follows from the camera's aspect ratio. Both dims
         are snapped down to multiples of TILE_SIZE so the kernel gets whole
         tiles.
+
+        The aspect ratio comes from the *stable* camera viewport
+        (`camera_state.aspect`, which only changes on browser-window resize),
+        NOT from nerfview's `viewer_width/height`. nerfview adaptively
+        downscales those every frame to hit a target FPS, and the W/H ratio it
+        writes jitters frame-to-frame; deriving our render size from them made
+        the output image resize on consecutive frames, which viser stretches to
+        the viewport as visible flicker. Camera-path *preview* renders keep
+        using the render panel's explicit dims (the user picked that aspect).
 
         Returns (req_W, req_H, W, H) — the original request alongside the
         resolved size, useful for logging.
@@ -153,14 +164,23 @@ class GaussianViewer:
         if render_tab_state.preview_render:
             req_W = render_tab_state.render_width
             req_H = render_tab_state.render_height
+            aspect = req_W / req_H if req_H > 0 else 0.0
         else:
             req_W = render_tab_state.viewer_width
             req_H = render_tab_state.viewer_height
+            # Stable viewport aspect; fall back to requested dims if the client
+            # hasn't reported its camera aspect yet.
+            aspect = getattr(camera_state, "aspect", 0.0) or (
+                req_W / req_H if req_H > 0 else 0.0
+            )
 
-        if req_W <= 0 or req_H <= 0:
+        # The render size is derived purely from `aspect` + max_resolution, so
+        # a valid aspect is sufficient even if nerfview hasn't reported
+        # viewer_width/height yet (e.g. the first frame). Only bail when we
+        # have no usable aspect at all.
+        if aspect <= 0:
             return req_W, req_H, max(req_W, 1), max(req_H, 1)
 
-        aspect = req_W / req_H
         if aspect >= 1.0:  # landscape: H is the shorter dim
             H = self.max_resolution
             W = int(self.max_resolution * aspect)
@@ -187,7 +207,7 @@ class GaussianViewer:
                 flush=True,
             )
 
-        req_W, req_H, W, H = self._resolve_render_size(render_tab_state)
+        req_W, req_H, W, H = self._resolve_render_size(camera_state, render_tab_state)
         if W <= 0 or H <= 0:
             return np.zeros((max(req_H, 1), max(req_W, 1), 3), dtype=np.uint8)
 
